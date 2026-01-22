@@ -26,12 +26,12 @@ export class AuthManager {
         getRedirectResult(auth)
             .then((result) => {
                 if (result?.user) {
-                    console.log("Redirect sign-in success:", result.user);
+                    console.log('Redirect sign-in success:', result.user);
                     // onAuthStateChanged will handle the UI update
                 }
             })
             .catch((error) => {
-                console.error("Redirect sign-in failed:", error);
+                console.error('Redirect sign-in failed:', error);
                 if (window.__TAURI__) {
                     // Avoid alert() loop if something goes generic-wrong on load in Tauri
                     console.error('Tauri auth redirect error:', error);
@@ -62,12 +62,12 @@ export class AuthManager {
 
         // Force account selection
         provider.setCustomParameters({
-            prompt: "select_account",
+            prompt: 'select_account',
         });
 
         try {
             // Detect Tauri / WebView environment
-            const isTauri = typeof window !== "undefined" && window.__TAURI__ !== undefined;
+            const isTauri = typeof window !== 'undefined' && window.__TAURI__ !== undefined;
 
             if (isTauri) {
                 // Redirect-based auth for Tauri
