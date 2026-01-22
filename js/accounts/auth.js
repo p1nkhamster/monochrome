@@ -2,6 +2,8 @@
 import { auth, provider } from './config.js';
 import {
     signInWithPopup,
+    signInWithRedirect,
+    getRedirectResult,
     signOut as firebaseSignOut,
     onAuthStateChanged,
     signInWithEmailAndPassword,
@@ -18,6 +20,23 @@ export class AuthManager {
 
     init() {
         if (!auth) return;
+
+        // Handle redirect result (Required for Tauri)
+        // This is a no-op in browsers if no redirect happened
+        getRedirectResult(auth)
+            .then((result) => {
+                if (result?.user) {
+                    console.log("Redirect sign-in success:", result.user);
+                    // onAuthStateChanged will handle the UI update
+                }
+            })
+            .catch((error) => {
+                console.error("Redirect sign-in failed:", error);
+                if (window.__TAURI__) {
+                    // Avoid alert() loop if something goes generic-wrong on load in Tauri
+                    console.error('Tauri auth redirect error:', error);
+                }
+            });
 
         this.unsubscribe = onAuthStateChanged(auth, (user) => {
             this.user = user;
@@ -41,13 +60,32 @@ export class AuthManager {
             return;
         }
 
+        // Force account selection
+        provider.setCustomParameters({
+            prompt: "select_account",
+        });
+
         try {
-            const result = await signInWithPopup(auth, provider);
-            // The onAuthStateChanged listener will handle the rest
-            return result.user;
+            // Detect Tauri / WebView environment
+            const isTauri = typeof window !== "undefined" && window.__TAURI__ !== undefined;
+
+            if (isTauri) {
+                // Redirect-based auth for Tauri
+                await signInWithRedirect(auth, provider);
+                return null; // result comes from getRedirectResult
+            } else {
+                // Popup-based auth for normal browsers
+                const result = await signInWithPopup(auth, provider);
+                return result.user;
+            }
         } catch (error) {
             console.error('Login failed:', error);
-            alert(`Login failed: ${error.message}`);
+
+            // Avoid alert() in Tauri auth flows if possible, or keep it generic
+            if (!window.__TAURI__) {
+                alert(`Login failed: ${error.message}`);
+            }
+
             throw error;
         }
     }
