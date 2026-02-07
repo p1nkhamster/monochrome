@@ -1,7 +1,7 @@
 export class MusicDatabase {
     constructor() {
         this.dbName = 'MonochromeDB';
-        this.version = 6;
+        this.version = 7;
         this.db = null;
     }
 
@@ -53,6 +53,10 @@ export class MusicDatabase {
                     const store = db.createObjectStore('user_playlists', { keyPath: 'id' });
                     store.createIndex('createdAt', 'createdAt', { unique: false });
                 }
+                if (!db.objectStoreNames.contains('user_folders')) {
+                    const store = db.createObjectStore('user_folders', { keyPath: 'id' });
+                    store.createIndex('createdAt', 'createdAt', { unique: false });
+                }
                 if (!db.objectStoreNames.contains('settings')) {
                     db.createObjectStore('settings');
                 }
@@ -77,26 +81,44 @@ export class MusicDatabase {
         });
     }
 
-    async getAll(storeName) {
-        return await this.performTransaction(storeName, 'readonly', (store) => store.getAll());
-    }
-
     // History API
     async addToHistory(track) {
         const storeName = 'history_tracks';
         const minified = this._minifyItem('track', track);
-        // Use a unique timestamp even if called rapidly
-        // (though unlikely to be <1ms for playback start)
-        const entry = { ...minified, timestamp: Date.now() };
+        const timestamp = Date.now();
+        const entry = { ...minified, timestamp };
 
         const db = await this.open();
-        const transaction = db.transaction(storeName, 'readwrite');
-        const store = transaction.objectStore(storeName);
 
-        // Add new entry
-        store.put(entry);
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction(storeName, 'readwrite');
+            const store = transaction.objectStore(storeName);
+            const index = store.index('timestamp');
 
-        return entry;
+            // Check the most recent entry
+            const cursorReq = index.openCursor(null, 'prev');
+
+            cursorReq.onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    const lastTrack = cursor.value;
+                    if (lastTrack.id === track.id) {
+                        // If same track, delete the old entry so we just update the timestamp
+                        store.delete(cursor.primaryKey);
+                    }
+                }
+                // Add the new entry
+                store.put(entry);
+            };
+
+            cursorReq.onerror = (_e) => {
+                // If cursor fails, just try to put (fallback)
+                store.put(entry);
+            };
+
+            transaction.oncomplete = () => resolve(entry);
+            transaction.onerror = (e) => reject(e.target.error);
+        });
     }
 
     async getHistory() {
@@ -112,6 +134,19 @@ export class MusicDatabase {
                 // Return reversed (newest first)
                 resolve(request.result.reverse());
             };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async clearHistory() {
+        const storeName = 'history_tracks';
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction(storeName, 'readwrite');
+            const store = transaction.objectStore(storeName);
+            const request = store.clear();
+
+            request.onsuccess = () => resolve();
             request.onerror = () => reject(request.error);
         });
     }
@@ -196,6 +231,7 @@ export class MusicDatabase {
                           vibrantColor: item.album.vibrantColor || null,
                           artist: item.album.artist || null,
                           numberOfTracks: item.album.numberOfTracks || null,
+                          mediaMetadata: item.album.mediaMetadata ? { tags: item.album.mediaMetadata.tags } : null,
                       }
                     : null,
                 copyright: item.copyright || null,
@@ -207,6 +243,12 @@ export class MusicDatabase {
                 version: item.version || null,
                 // Keep mix info
                 mixes: item.mixes || null,
+                isTracker: item.isTracker || (item.id && String(item.id).startsWith('tracker-')),
+                trackerInfo: item.trackerInfo || null,
+                audioUrl: item.remoteUrl || item.audioUrl || null,
+                remoteUrl: item.remoteUrl || null,
+                audioQuality: item.audioQuality || null,
+                mediaMetadata: item.mediaMetadata ? { tags: item.mediaMetadata.tags } : null,
             };
         }
 
@@ -273,6 +315,7 @@ export class MusicDatabase {
         const history = await this.getHistory();
 
         const userPlaylists = await this.getPlaylists(true);
+        const userFolders = await this.getFolders();
         const data = {
             favorites_tracks: tracks.map((t) => this._minifyItem('track', t)),
             favorites_albums: albums.map((a) => this._minifyItem('album', a)),
@@ -281,6 +324,7 @@ export class MusicDatabase {
             favorites_mixes: mixes.map((m) => this._minifyItem('mix', m)),
             history_tracks: history.map((t) => this._minifyItem('track', t)),
             user_playlists: userPlaylists,
+            user_folders: userFolders,
         };
         return data;
     }
@@ -375,6 +419,7 @@ export class MusicDatabase {
             mixes: data.favorites_mixes?.length || 0,
             history: data.history_tracks?.length || 0,
             userPlaylists: data.user_playlists?.length || 0,
+            user_folders: data.user_folders?.length || 0,
         });
 
         const results = await Promise.all([
@@ -385,6 +430,7 @@ export class MusicDatabase {
             importStore('favorites_mixes', data.favorites_mixes),
             importStore('history_tracks', data.history_tracks),
             data.user_playlists ? importStore('user_playlists', data.user_playlists) : Promise.resolve(false),
+            data.user_folders ? importStore('user_folders', data.user_folders) : Promise.resolve(false),
         ]);
 
         console.log('Import results:', results);
@@ -425,7 +471,7 @@ export class MusicDatabase {
         const playlist = {
             id: id,
             name: name,
-            tracks: tracks.map((t) => this._minifyItem('track', t)),
+            tracks: tracks.map((t) => this._minifyItem('track', { ...t, addedAt: Date.now() })),
             cover: cover,
             createdAt: Date.now(),
             updatedAt: Date.now(),
@@ -445,7 +491,8 @@ export class MusicDatabase {
         const playlist = await this.performTransaction('user_playlists', 'readonly', (store) => store.get(playlistId));
         if (!playlist) throw new Error('Playlist not found');
         playlist.tracks = playlist.tracks || [];
-        const minifiedTrack = this._minifyItem('track', track);
+        const trackWithDate = { ...track, addedAt: Date.now() };
+        const minifiedTrack = this._minifyItem('track', trackWithDate);
         if (playlist.tracks.some((t) => t.id === track.id)) return;
         playlist.tracks.push(minifiedTrack);
         playlist.updatedAt = Date.now();
@@ -457,11 +504,35 @@ export class MusicDatabase {
         return playlist;
     }
 
+    async addTracksToPlaylist(playlistId, tracks) {
+        const playlist = await this.performTransaction('user_playlists', 'readonly', (store) => store.get(playlistId));
+        if (!playlist) throw new Error('Playlist not found');
+        playlist.tracks = playlist.tracks || [];
+
+        let addedCount = 0;
+        for (const track of tracks) {
+            if (!playlist.tracks.some((t) => t.id === track.id)) {
+                const trackWithDate = { ...track, addedAt: Date.now() };
+                playlist.tracks.push(this._minifyItem('track', trackWithDate));
+                addedCount++;
+            }
+        }
+
+        if (addedCount > 0) {
+            playlist.updatedAt = Date.now();
+            this._updatePlaylistMetadata(playlist);
+            await this.performTransaction('user_playlists', 'readwrite', (store) => store.put(playlist));
+            this._dispatchPlaylistSync('update', playlist);
+        }
+
+        return playlist;
+    }
+
     async removeTrackFromPlaylist(playlistId, trackId) {
         const playlist = await this.performTransaction('user_playlists', 'readonly', (store) => store.get(playlistId));
         if (!playlist) throw new Error('Playlist not found');
         playlist.tracks = playlist.tracks || [];
-        playlist.tracks = playlist.tracks.filter((t) => t.id !== trackId);
+        playlist.tracks = playlist.tracks.filter((t) => t.id != trackId);
         playlist.updatedAt = Date.now();
         this._updatePlaylistMetadata(playlist);
         await this.performTransaction('user_playlists', 'readwrite', (store) => store.put(playlist));
@@ -490,6 +561,53 @@ export class MusicDatabase {
         this._dispatchPlaylistSync('update', playlist);
 
         return playlist;
+    }
+
+    async addPlaylistToFolder(folderId, playlistId) {
+        const folder = await this.getFolder(folderId);
+        if (!folder) throw new Error('Folder not found');
+        folder.playlists = folder.playlists || [];
+        if (!folder.playlists.includes(playlistId)) {
+            folder.playlists.push(playlistId);
+            folder.updatedAt = Date.now();
+            await this.performTransaction('user_folders', 'readwrite', (store) => store.put(folder));
+        }
+        return folder;
+    }
+
+    // User Folders API
+    async createFolder(name, cover = '') {
+        const id = crypto.randomUUID();
+        const folder = {
+            id: id,
+            name: name,
+            cover: cover,
+            playlists: [],
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+        };
+        await this.performTransaction('user_folders', 'readwrite', (store) => store.put(folder));
+        return folder;
+    }
+
+    async getFolders() {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction('user_folders', 'readonly');
+            const store = transaction.objectStore('user_folders');
+            const index = store.index('createdAt');
+            const request = index.getAll();
+            request.onsuccess = () => resolve(request.result.reverse());
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async getFolder(id) {
+        return await this.performTransaction('user_folders', 'readonly', (store) => store.get(id));
+    }
+
+    async deleteFolder(id) {
+        await this.performTransaction('user_folders', 'readwrite', (store) => store.delete(id));
     }
 
     async getPlaylists(includeTracks = false) {

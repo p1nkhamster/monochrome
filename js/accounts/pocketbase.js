@@ -1,9 +1,14 @@
+//js/accounts/pocketbase.js
 import PocketBase from 'pocketbase';
 import { db } from '../db.js';
 import { authManager } from './auth.js';
 
 const PUBLIC_COLLECTION = 'public_playlists';
-const POCKETBASE_URL = 'https://monodb.samidy.com';
+const DEFAULT_POCKETBASE_URL = 'https://monodb.samidy.com';
+const POCKETBASE_URL = localStorage.getItem('monochrome-pocketbase-url') || DEFAULT_POCKETBASE_URL;
+
+console.log('[PocketBase] Using URL:', POCKETBASE_URL);
+
 const pb = new PocketBase(POCKETBASE_URL);
 pb.autoCancellation(false);
 
@@ -13,10 +18,8 @@ const syncManager = {
     _isSyncing: false,
 
     async _getUserRecord(uid) {
-        if (!uid) {
-            console.warn('_getUserRecord called with no UID.');
-            return null;
-        }
+        if (!uid) return null;
+
         if (this._userRecordCache && this._userRecordCache.firebase_id === uid) {
             return this._userRecordCache;
         }
@@ -33,17 +36,19 @@ const syncManager = {
                             firebase_id: uid,
                             library: {},
                             history: [],
+                            user_playlists: {},
+                            user_folders: {},
                         },
                         { f_id: uid }
                     );
                     this._userRecordCache = newRecord;
                     return newRecord;
                 } catch (createError) {
-                    console.error('Failed to create user record in PocketBase:', createError);
+                    console.error('[PocketBase] Failed to create user:', createError);
                     return null;
                 }
             }
-            console.error('Failed to get user record from PocketBase:', error);
+            console.error('[PocketBase] Failed to get user:', error);
             return null;
         }
     },
@@ -58,8 +63,9 @@ const syncManager = {
         const library = this.safeParseInternal(record.library, 'library', {});
         const history = this.safeParseInternal(record.history, 'history', []);
         const userPlaylists = this.safeParseInternal(record.user_playlists, 'user_playlists', {});
+        const userFolders = this.safeParseInternal(record.user_folders, 'user_folders', {});
 
-        return { library, history, userPlaylists };
+        return { library, history, userPlaylists, userFolders };
     },
 
     async _updateUserJSON(uid, field, data) {
@@ -94,6 +100,26 @@ const syncManager = {
                 });
                 return JSON.parse(recovered);
             } catch {
+                try {
+                    // Python-style fallback (Single quotes, True/False, None)
+                    // This handles data that was incorrectly serialized as Python repr string
+                    if (str.includes("'") || str.includes('True') || str.includes('False')) {
+                        const jsFriendly = str
+                            .replace(/\bTrue\b/g, 'true')
+                            .replace(/\bFalse\b/g, 'false')
+                            .replace(/\bNone\b/g, 'null');
+
+                        // Basic safety check: ensure it looks like a structure and doesn't contain obvious code vectors
+                        if (
+                            (jsFriendly.trim().startsWith('[') || jsFriendly.trim().startsWith('{')) &&
+                            !jsFriendly.match(/function|=>|window|document|alert|eval/)
+                        ) {
+                            return new Function('return ' + jsFriendly)();
+                        }
+                    }
+                } catch (error) {
+                    console.log(error); // Ignore fallback error
+                }
                 return fallback;
             }
         }
@@ -234,6 +260,7 @@ const syncManager = {
 
         if (action === 'delete') {
             delete userPlaylists[playlist.id];
+            await this.unpublishPlaylist(playlist.id);
         } else {
             userPlaylists[playlist.id] = {
                 id: playlist.id,
@@ -246,9 +273,38 @@ const syncManager = {
                 images: playlist.images || [],
                 isPublic: playlist.isPublic || false,
             };
+
+            if (playlist.isPublic) {
+                await this.publishPlaylist(playlist);
+            }
         }
 
         await this._updateUserJSON(user.uid, 'user_playlists', userPlaylists);
+    },
+
+    async syncUserFolder(folder, action) {
+        const user = authManager.user;
+        if (!user) return;
+
+        const record = await this._getUserRecord(user.uid);
+        if (!record) return;
+
+        let userFolders = this.safeParseInternal(record.user_folders, 'user_folders', {});
+
+        if (action === 'delete') {
+            delete userFolders[folder.id];
+        } else {
+            userFolders[folder.id] = {
+                id: folder.id,
+                name: folder.name,
+                cover: folder.cover || null,
+                playlists: folder.playlists || [],
+                createdAt: folder.createdAt || Date.now(),
+                updatedAt: folder.updatedAt || Date.now(),
+            };
+        }
+
+        await this._updateUserJSON(user.uid, 'user_folders', userFolders);
     },
 
     async getPublicPlaylist(uuid) {
@@ -327,7 +383,7 @@ const syncManager = {
             image: playlist.cover,
             cover: playlist.cover,
             playlist_cover: playlist.cover,
-            tracks: playlist.tracks,
+            tracks: JSON.stringify(playlist.tracks || []),
             isPublic: true,
             data: {
                 title: playlist.name,
@@ -418,9 +474,10 @@ const syncManager = {
                         mixes: (await getAll('favorites_mixes')) || [],
                         history: (await getAll('history_tracks')) || [],
                         userPlaylists: (await getAll('user_playlists')) || [],
+                        userFolders: (await getAll('user_folders')) || [],
                     };
 
-                    let { library, history, userPlaylists } = cloudData;
+                    let { library, history, userPlaylists, userFolders } = cloudData;
                     let needsUpdate = false;
 
                     if (!library) library = {};
@@ -430,6 +487,7 @@ const syncManager = {
                     if (!library.playlists) library.playlists = {};
                     if (!library.mixes) library.mixes = {};
                     if (!userPlaylists) userPlaylists = {};
+                    if (!userFolders) userFolders = {};
                     if (!history) history = [];
 
                     const mergeItem = (collection, item, type) => {
@@ -463,6 +521,20 @@ const syncManager = {
                         }
                     });
 
+                    localData.userFolders.forEach((folder) => {
+                        if (!userFolders[folder.id]) {
+                            userFolders[folder.id] = {
+                                id: folder.id,
+                                name: folder.name,
+                                cover: folder.cover || null,
+                                playlists: folder.playlists || [],
+                                createdAt: folder.createdAt || Date.now(),
+                                updatedAt: folder.updatedAt || Date.now(),
+                            };
+                            needsUpdate = true;
+                        }
+                    });
+
                     if (history.length === 0 && localData.history.length > 0) {
                         history = localData.history;
                         needsUpdate = true;
@@ -471,6 +543,7 @@ const syncManager = {
                     if (needsUpdate) {
                         await this._updateUserJSON(user.uid, 'library', library);
                         await this._updateUserJSON(user.uid, 'user_playlists', userPlaylists);
+                        await this._updateUserJSON(user.uid, 'user_folders', userFolders);
                         await this._updateUserJSON(user.uid, 'history', history);
                     }
 
@@ -482,6 +555,7 @@ const syncManager = {
                         favorites_mixes: Object.values(library.mixes).filter((m) => m && typeof m === 'object'),
                         history_tracks: history,
                         user_playlists: Object.values(userPlaylists).filter((p) => p && typeof p === 'object'),
+                        user_folders: Object.values(userFolders).filter((f) => f && typeof f === 'object'),
                     };
 
                     await database.importData(convertedData);
@@ -490,9 +564,11 @@ const syncManager = {
                     window.dispatchEvent(new CustomEvent('library-changed'));
                     window.dispatchEvent(new CustomEvent('history-changed'));
                     window.dispatchEvent(new HashChangeEvent('hashchange'));
+
+                    console.log('[PocketBase] ✓ Sync completed');
                 }
             } catch (error) {
-                console.error('Error during PocketBase sync!', error);
+                console.error('[PocketBase] Sync error:', error);
             } finally {
                 this._isSyncing = false;
             }

@@ -1,4 +1,6 @@
 //js/lastfm.js
+import { lastFMStorage } from './storage.js';
+
 export class LastFMScrobbler {
     constructor() {
         this.API_KEY = '0ecf01914957b40c17030db822845a76';
@@ -47,7 +49,34 @@ export class LastFMScrobbler {
     }
 
     isAuthenticated() {
-        return !!this.sessionKey;
+        return !!this.sessionKey && lastFMStorage.isEnabled();
+    }
+
+    _getScrobbleArtist(track) {
+        if (!track) return 'Unknown Artist';
+
+        // Get the primary artist name
+        let artistName = 'Unknown Artist';
+
+        if (track.artist?.name) {
+            artistName = track.artist.name;
+        } else if (typeof track.artist === 'string') {
+            artistName = track.artist;
+        } else if (track.artists && track.artists.length > 0) {
+            // Only use the FIRST artist (main artist)
+            const first = track.artists[0];
+            artistName = typeof first === 'string' ? first : first.name || 'Unknown Artist';
+        }
+
+        if (typeof artistName !== 'string') return 'Unknown Artist';
+
+        // Strip featured artists: split on &, feat., ft., featuring, with, etc.
+        // Only keep the part BEFORE these indicators
+        artistName = artistName
+            .split(/\s*[&]\s*|\s+feat\.?\s+|\s+ft\.?\s+|\s+featuring\s+|\s+with\s+|\s+x\s+/i)[0]
+            .trim();
+
+        return artistName || 'Unknown Artist';
     }
 
     async generateSignature(params) {
@@ -153,9 +182,10 @@ export class LastFMScrobbler {
         this.clearScrobbleTimer();
 
         try {
+            const scrobbleTitle = track.cleanTitle || track.title;
             const params = {
-                artist: track.artists?.[0]?.name || track.artist?.name || 'Unknown Artist',
-                track: track.title,
+                artist: this._getScrobbleArtist(track),
+                track: scrobbleTitle,
             };
 
             if (track.album?.title) {
@@ -172,7 +202,7 @@ export class LastFMScrobbler {
 
             await this.makeRequest('track.updateNowPlaying', params, true);
 
-            console.log('Now playing updated:', track.title);
+            console.log('Now playing updated:', scrobbleTitle);
 
             this.scrobbleThreshold = Math.min(track.duration / 2, 240);
             this.scheduleScrobble(this.scrobbleThreshold * 1000);
@@ -201,10 +231,11 @@ export class LastFMScrobbler {
 
         try {
             const timestamp = Math.floor(Date.now() / 1000);
+            const scrobbleTitle = this.currentTrack.cleanTitle || this.currentTrack.title;
 
             const params = {
-                artist: this.currentTrack.artists?.[0]?.name || this.currentTrack.artist?.name || 'Unknown Artist',
-                track: this.currentTrack.title,
+                artist: this._getScrobbleArtist(this.currentTrack),
+                track: scrobbleTitle,
                 timestamp: timestamp,
             };
 
@@ -223,7 +254,7 @@ export class LastFMScrobbler {
             await this.makeRequest('track.scrobble', params, true);
 
             this.hasScrobbled = true;
-            console.log('Scrobbled:', this.currentTrack.title);
+            console.log('Scrobbled:', this.currentTrack.cleanTitle || this.currentTrack.title);
         } catch (error) {
             console.error('Failed to scrobble:', error);
         }
@@ -234,7 +265,7 @@ export class LastFMScrobbler {
 
         try {
             const params = {
-                artist: track.artists?.[0]?.name || track.artist?.name || 'Unknown Artist',
+                artist: this._getScrobbleArtist(track),
                 track: track.title,
             };
 

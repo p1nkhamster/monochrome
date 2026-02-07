@@ -6,9 +6,11 @@ import {
     getTrackArtists,
     getTrackTitle,
     getTrackArtistsHTML,
+    getTrackYearDisplay,
     createQualityBadgeHTML,
 } from './utils.js';
-import { queueManager, replayGainSettings } from './storage.js';
+import { queueManager, replayGainSettings, trackDateSettings } from './storage.js';
+import { audioContextManager } from './audio-context.js';
 
 export class Player {
     constructor(audioElement, api, quality = 'HI_RES_LOSSLESS') {
@@ -26,6 +28,7 @@ export class Player {
         this.currentTrack = null;
         this.currentRgValues = null;
         this.userVolume = parseFloat(localStorage.getItem('volume') || '0.7');
+        this.isFallbackRetry = false;
 
         // Sleep timer properties
         this.sleepTimer = null;
@@ -48,6 +51,17 @@ export class Player {
 
         window.addEventListener('beforeunload', () => {
             this.saveQueueState();
+        });
+
+        // Handle visibility change for iOS - AudioContext gets suspended when screen locks
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && !this.audio.paused) {
+                // Ensure audio context is resumed when user returns to the app
+                if (!audioContextManager.isReady()) {
+                    audioContextManager.init(this.audio);
+                }
+                audioContextManager.resume();
+            }
         });
     }
 
@@ -100,7 +114,7 @@ export class Player {
             this.originalQueueBeforeShuffle = savedState.originalQueueBeforeShuffle || [];
             this.currentQueueIndex = savedState.currentQueueIndex ?? -1;
             this.shuffleActive = savedState.shuffleActive || false;
-            this.repeatMode = savedState.repeatMode || REPEAT_MODE.OFF;
+            this.repeatMode = savedState.repeatMode !== undefined ? savedState.repeatMode : REPEAT_MODE.OFF;
 
             // Restore current track if queue exists and index is valid
             const currentQueue = this.shuffleActive ? this.shuffledQueue : this.queue;
@@ -111,15 +125,7 @@ export class Player {
                 const track = this.currentTrack;
                 const trackTitle = getTrackTitle(track);
                 const trackArtistsHTML = getTrackArtistsHTML(track);
-
-                let yearDisplay = '';
-                const releaseDate = track.album?.releaseDate || track.streamStartDate;
-                if (releaseDate) {
-                    const date = new Date(releaseDate);
-                    if (!isNaN(date.getTime())) {
-                        yearDisplay = ` • ${date.getFullYear()}`;
-                    }
-                }
+                const yearDisplay = getTrackYearDisplay(track);
 
                 const coverEl = document.querySelector('.now-playing-bar .cover');
                 const titleEl = document.querySelector('.now-playing-bar .title');
@@ -142,6 +148,11 @@ export class Player {
                     }
                 }
                 if (artistEl) artistEl.innerHTML = trackArtistsHTML + yearDisplay;
+
+                // Fetch album release date in background if missing
+                if (!yearDisplay && track.album?.id) {
+                    this.loadAlbumYear(track, trackArtistsHTML, artistEl);
+                }
 
                 const mixBtn = document.getElementById('now-playing-mix-btn');
                 if (mixBtn) {
@@ -166,24 +177,51 @@ export class Player {
             shuffleActive: this.shuffleActive,
             repeatMode: this.repeatMode,
         });
+
+        if (window.renderQueueFunction) {
+            window.renderQueueFunction();
+        }
     }
 
     setupMediaSession() {
         if (!('mediaSession' in navigator)) return;
 
-        navigator.mediaSession.setActionHandler('play', () => {
-            this.audio.play().catch(console.error);
+        navigator.mediaSession.setActionHandler('play', async () => {
+            // Initialize and resume audio context first (required for iOS lock screen)
+            // Must happen before audio.play() or audio won't route through Web Audio
+            if (!audioContextManager.isReady()) {
+                audioContextManager.init(this.audio);
+            }
+            await audioContextManager.resume();
+
+            try {
+                await this.audio.play();
+            } catch (e) {
+                console.error('MediaSession play failed:', e);
+                // If play fails, try to handle it like a regular play/pause
+                this.handlePlayPause();
+            }
         });
 
         navigator.mediaSession.setActionHandler('pause', () => {
             this.audio.pause();
         });
 
-        navigator.mediaSession.setActionHandler('previoustrack', () => {
+        navigator.mediaSession.setActionHandler('previoustrack', async () => {
+            // Ensure audio context is active for iOS lock screen controls
+            if (!audioContextManager.isReady()) {
+                audioContextManager.init(this.audio);
+            }
+            await audioContextManager.resume();
             this.playPrev();
         });
 
-        navigator.mediaSession.setActionHandler('nexttrack', () => {
+        navigator.mediaSession.setActionHandler('nexttrack', async () => {
+            // Ensure audio context is active for iOS lock screen controls
+            if (!audioContextManager.isReady()) {
+                audioContextManager.init(this.audio);
+            }
+            await audioContextManager.resume();
             this.playNext();
         });
 
@@ -233,7 +271,8 @@ export class Player {
 
         for (const { track } of tracksToPreload) {
             if (this.preloadCache.has(track.id)) continue;
-            if (track.isLocal) continue;
+            const isTracker = track.isTracker || (track.id && String(track.id).startsWith('tracker-'));
+            if (track.isLocal || isTracker || (track.audioUrl && !track.isLocal)) continue;
             try {
                 const streamUrl = await this.api.getStreamUrl(track.id, this.quality);
 
@@ -253,7 +292,7 @@ export class Player {
         }
     }
 
-    async playTrackFromQueue(startTime = 0) {
+    async playTrackFromQueue(startTime = 0, recursiveCount = 0) {
         const currentQueue = this.shuffleActive ? this.shuffledQueue : this.queue;
         if (this.currentQueueIndex < 0 || this.currentQueueIndex >= currentQueue.length) {
             return;
@@ -272,19 +311,10 @@ export class Player {
 
         const trackTitle = getTrackTitle(track);
         const trackArtistsHTML = getTrackArtistsHTML(track);
-
-        let yearDisplay = '';
-        const releaseDate = track.album?.releaseDate || track.streamStartDate;
-        if (releaseDate) {
-            const date = new Date(releaseDate);
-            if (!isNaN(date.getTime())) {
-                yearDisplay = ` • ${date.getFullYear()}`;
-            }
-        }
+        const yearDisplay = getTrackYearDisplay(track);
 
         document.querySelector('.now-playing-bar .cover').src = this.api.getCoverUrl(track.album?.cover);
-        const qualityBadge = createQualityBadgeHTML(track);
-        document.querySelector('.now-playing-bar .title').innerHTML = `${trackTitle} ${qualityBadge}`;
+        document.querySelector('.now-playing-bar .title').innerHTML = `${trackTitle} ${createQualityBadgeHTML(track)}`;
         const albumEl = document.querySelector('.now-playing-bar .album');
         if (albumEl) {
             const albumTitle = track.album?.title || '';
@@ -296,7 +326,13 @@ export class Player {
                 albumEl.style.display = 'none';
             }
         }
-        document.querySelector('.now-playing-bar .artist').innerHTML = trackArtistsHTML + yearDisplay;
+        const artistEl = document.querySelector('.now-playing-bar .artist');
+        artistEl.innerHTML = trackArtistsHTML + yearDisplay;
+
+        // Fetch album release date in background if missing
+        if (!yearDisplay && track.album?.id) {
+            this.loadAlbumYear(track, trackArtistsHTML, artistEl);
+        }
 
         const mixBtn = document.getElementById('now-playing-mix-btn');
         if (mixBtn) {
@@ -305,11 +341,80 @@ export class Player {
         document.title = `${trackTitle} • ${getTrackArtists(track)}`;
 
         this.updatePlayingTrackIndicator();
+        this.updateMediaSession(track);
+        this.updateMediaSessionPlaybackState();
 
         try {
             let streamUrl;
 
-            if (track.isLocal && track.file) {
+            const isTracker = track.isTracker || (track.id && String(track.id).startsWith('tracker-'));
+
+            if (isTracker || (track.audioUrl && !track.isLocal)) {
+                if (this.dashInitialized) {
+                    this.dashPlayer.reset();
+                    this.dashInitialized = false;
+                }
+                streamUrl = track.audioUrl;
+
+                if (
+                    (!streamUrl || (typeof streamUrl === 'string' && streamUrl.startsWith('blob:'))) &&
+                    track.remoteUrl
+                ) {
+                    streamUrl = track.remoteUrl;
+                }
+
+                if (!streamUrl) {
+                    console.warn(`Track ${trackTitle} audio URL is missing. Skipping.`);
+                    track.isUnavailable = true;
+                    this.playNext();
+                    return;
+                }
+
+                if (isTracker && !streamUrl.startsWith('blob:') && streamUrl.startsWith('http')) {
+                    try {
+                        const response = await fetch(streamUrl);
+                        if (response.ok) {
+                            const blob = await response.blob();
+                            streamUrl = URL.createObjectURL(blob);
+                        }
+                    } catch (e) {
+                        console.warn('Failed to fetch tracker blob, trying direct link', e);
+                    }
+                }
+
+                this.currentRgValues = null;
+                this.applyReplayGain();
+
+                this.audio.src = streamUrl;
+
+                // Wait for audio to be ready before playing (prevents restart issues with blob URLs)
+                await new Promise((resolve, reject) => {
+                    const onCanPlay = () => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        resolve();
+                    };
+                    const onError = (e) => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        reject(e);
+                    };
+                    this.audio.addEventListener('canplay', onCanPlay);
+                    this.audio.addEventListener('error', onError);
+
+                    // Timeout after 10 seconds
+                    setTimeout(() => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        reject(new Error('Timeout waiting for audio to load'));
+                    }, 10000);
+                });
+
+                if (startTime > 0) {
+                    this.audio.currentTime = startTime;
+                }
+                await this.audio.play();
+            } else if (track.isLocal && track.file) {
                 if (this.dashInitialized) {
                     this.dashPlayer.reset(); // Ensure dash is off
                     this.dashInitialized = false;
@@ -319,6 +424,30 @@ export class Player {
                 this.applyReplayGain();
 
                 this.audio.src = streamUrl;
+
+                // Wait for audio to be ready before playing
+                await new Promise((resolve, reject) => {
+                    const onCanPlay = () => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        resolve();
+                    };
+                    const onError = (e) => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        reject(e);
+                    };
+                    this.audio.addEventListener('canplay', onCanPlay);
+                    this.audio.addEventListener('error', onError);
+
+                    // Timeout after 10 seconds
+                    setTimeout(() => {
+                        this.audio.removeEventListener('canplay', onCanPlay);
+                        this.audio.removeEventListener('error', onError);
+                        reject(new Error('Timeout waiting for audio to load'));
+                    }, 10000);
+                });
+
                 if (startTime > 0) {
                     this.audio.currentTime = startTime;
                 }
@@ -366,6 +495,30 @@ export class Player {
                         this.dashInitialized = false;
                     }
                     this.audio.src = streamUrl;
+
+                    // Wait for audio to be ready before playing
+                    await new Promise((resolve, reject) => {
+                        const onCanPlay = () => {
+                            this.audio.removeEventListener('canplay', onCanPlay);
+                            this.audio.removeEventListener('error', onError);
+                            resolve();
+                        };
+                        const onError = (e) => {
+                            this.audio.removeEventListener('canplay', onCanPlay);
+                            this.audio.removeEventListener('error', onError);
+                            reject(e);
+                        };
+                        this.audio.addEventListener('canplay', onCanPlay);
+                        this.audio.addEventListener('error', onError);
+
+                        // Timeout after 10 seconds
+                        setTimeout(() => {
+                            this.audio.removeEventListener('canplay', onCanPlay);
+                            this.audio.removeEventListener('error', onError);
+                            reject(new Error('Timeout waiting for audio to load'));
+                        }, 10000);
+                    });
+
                     if (startTime > 0) {
                         this.audio.currentTime = startTime;
                     }
@@ -373,12 +526,13 @@ export class Player {
                 }
             }
 
-            // Update Media Session AFTER play starts to ensure metadata is captured
-            this.updateMediaSession(track);
-            this.updateMediaSessionPlaybackState();
             this.preloadNextTracks();
         } catch (error) {
             console.error(`Could not play track: ${trackTitle}`, error);
+            // Skip to next track on unexpected error
+            if (recursiveCount < currentQueue.length) {
+                setTimeout(() => this.playNext(recursiveCount + 1), 1000);
+            }
         }
     }
 
@@ -386,7 +540,7 @@ export class Player {
         const currentQueue = this.shuffleActive ? this.shuffledQueue : this.queue;
         if (index >= 0 && index < currentQueue.length) {
             this.currentQueueIndex = index;
-            this.playTrackFromQueue();
+            this.playTrackFromQueue(0, 0);
         }
     }
 
@@ -401,8 +555,7 @@ export class Player {
         }
 
         if (this.repeatMode === REPEAT_MODE.ONE && !currentQueue[this.currentQueueIndex]?.isUnavailable) {
-            this.audio.currentTime = 0;
-            this.audio.play();
+            this.playTrackFromQueue(0, recursiveCount);
             return;
         }
 
@@ -422,7 +575,7 @@ export class Player {
             return;
         }
 
-        this.playTrackFromQueue();
+        this.playTrackFromQueue(0, recursiveCount);
     }
 
     playPrev(recursiveCount = 0) {
@@ -443,14 +596,14 @@ export class Player {
             if (currentQueue[this.currentQueueIndex].isUnavailable) {
                 return this.playPrev(recursiveCount + 1);
             }
-            this.playTrackFromQueue();
+            this.playTrackFromQueue(0, recursiveCount);
         }
     }
 
     handlePlayPause() {
         if (!this.audio.src || this.audio.error) {
             if (this.currentTrack) {
-                this.playTrackFromQueue();
+                this.playTrackFromQueue(0, 0);
             }
             return;
         }
@@ -460,7 +613,7 @@ export class Player {
                 if (e.name === 'NotAllowedError' || e.name === 'AbortError') return;
                 console.error('Play failed, reloading track:', e);
                 if (this.currentTrack) {
-                    this.playTrackFromQueue();
+                    this.playTrackFromQueue(0, 0);
                 }
             });
         } else {
@@ -528,30 +681,34 @@ export class Player {
         this.saveQueueState();
     }
 
-    addToQueue(track) {
-        this.queue.push(track);
+    addToQueue(trackOrTracks) {
+        const tracks = Array.isArray(trackOrTracks) ? trackOrTracks : [trackOrTracks];
+        this.queue.push(...tracks);
+
+        if (this.shuffleActive) {
+            this.shuffledQueue.push(...tracks);
+            this.originalQueueBeforeShuffle.push(...tracks);
+        }
 
         if (!this.currentTrack || this.currentQueueIndex === -1) {
-            this.currentQueueIndex = this.queue.length - 1;
-            this.playTrackFromQueue();
+            this.currentQueueIndex = this.getCurrentQueue().length - tracks.length;
+            this.playTrackFromQueue(0, 0);
         }
         this.saveQueueState();
     }
 
-    addNextToQueue(track) {
+    addNextToQueue(trackOrTracks) {
+        const tracks = Array.isArray(trackOrTracks) ? trackOrTracks : [trackOrTracks];
         const currentQueue = this.shuffleActive ? this.shuffledQueue : this.queue;
         const insertIndex = this.currentQueueIndex + 1;
 
         // Insert after current track
-        currentQueue.splice(insertIndex, 0, track);
+        currentQueue.splice(insertIndex, 0, ...tracks);
 
         // If we are shuffling, we might want to also add it to the original queue for consistency,
         // though syncing that is tricky. The standard logic often just appends to the active queue view.
         if (this.shuffleActive) {
-            this.originalQueueBeforeShuffle.push(track); // Just append to end of main list? Or logic needed.
-            // Simplest is to just modify the active playing queue.
-        } else {
-            // In linear mode, `currentQueue` IS `this.queue`
+            this.originalQueueBeforeShuffle.push(...tracks); // Sync original queue
         }
 
         this.saveQueueState();
@@ -587,10 +744,24 @@ export class Player {
     }
 
     clearQueue() {
-        this.queue = [];
-        this.shuffledQueue = [];
-        this.originalQueueBeforeShuffle = [];
-        this.currentQueueIndex = -1;
+        if (this.currentTrack) {
+            this.queue = [this.currentTrack];
+
+            if (this.shuffleActive) {
+                this.shuffledQueue = [this.currentTrack];
+                this.originalQueueBeforeShuffle = [this.currentTrack];
+            } else {
+                this.shuffledQueue = [];
+                this.originalQueueBeforeShuffle = [];
+            }
+            this.currentQueueIndex = 0;
+        } else {
+            this.queue = [];
+            this.shuffledQueue = [];
+            this.originalQueueBeforeShuffle = [];
+            this.currentQueueIndex = -1;
+        }
+
         this.preloadCache.clear();
         this.saveQueueState();
     }
@@ -629,6 +800,23 @@ export class Player {
             return currentQueue[0];
         }
         return null;
+    }
+
+    loadAlbumYear(track, trackArtistsHTML, artistEl) {
+        if (!trackDateSettings.useAlbumYear()) return;
+
+        this.api
+            .getAlbum(track.album.id)
+            .then(({ album }) => {
+                if (album?.releaseDate && this.currentTrack?.id === track.id) {
+                    track.album.releaseDate = album.releaseDate;
+                    const year = new Date(album.releaseDate).getFullYear();
+                    if (!isNaN(year) && artistEl) {
+                        artistEl.innerHTML = `${trackArtistsHTML} • ${year}`;
+                    }
+                }
+            })
+            .catch(() => {});
     }
 
     updatePlayingTrackIndicator() {

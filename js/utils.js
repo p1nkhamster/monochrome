@@ -1,5 +1,5 @@
 //js/utils.js
-import { qualityBadgeSettings } from './storage.js';
+import { qualityBadgeSettings, coverArtSizeSettings, trackDateSettings } from './storage.js';
 
 export const QUALITY = 'HI_RES_LOSSLESS';
 
@@ -66,6 +66,16 @@ export const formatTime = (seconds) => {
     return `${m}:${String(s).padStart(2, '0')}`;
 };
 
+export const getTrackYearDisplay = (track) => {
+    const useAlbumYear = trackDateSettings.useAlbumYear();
+    const releaseDate = useAlbumYear
+        ? track?.album?.releaseDate || track?.streamStartDate
+        : track?.streamStartDate || track?.album?.releaseDate;
+    if (!releaseDate) return '';
+    const date = new Date(releaseDate);
+    return isNaN(date.getTime()) ? '' : ` • ${date.getFullYear()}`;
+};
+
 export const createPlaceholder = (text, isLoading = false) => {
     return `<div class="placeholder-text ${isLoading ? 'loading' : ''}">${text}</div>`;
 };
@@ -80,6 +90,46 @@ export const sanitizeForFilename = (value) => {
         .trim();
 };
 
+/**
+ * Detects actual audio format from blob signature
+ * @param {Blob} blob - Audio blob to analyze
+ * @returns {Promise<string>} - Extension: 'flac', 'm4a', or fallback based on mime
+ */
+export const getExtensionFromBlob = async (blob) => {
+    const buffer = await blob.slice(0, 12).arrayBuffer();
+    const view = new DataView(buffer);
+
+    // Check for FLAC signature: "fLaC" (0x66 0x4C 0x61 0x43)
+    if (
+        view.byteLength >= 4 &&
+        view.getUint8(0) === 0x66 && // f
+        view.getUint8(1) === 0x4c && // L
+        view.getUint8(2) === 0x61 && // a
+        view.getUint8(3) === 0x43 // C
+    ) {
+        return 'flac';
+    }
+
+    // Check for MP4/M4A signature: "ftyp" at offset 4
+    if (
+        view.byteLength >= 8 &&
+        view.getUint8(4) === 0x66 && // f
+        view.getUint8(5) === 0x74 && // t
+        view.getUint8(6) === 0x79 && // y
+        view.getUint8(7) === 0x70 // p
+    ) {
+        return 'm4a';
+    }
+
+    // Fallback to MIME type
+    const mime = blob.type;
+    if (mime === 'audio/flac') return 'flac';
+    if (mime === 'audio/mp4' || mime === 'audio/x-m4a') return 'm4a';
+
+    // Default fallback
+    return 'flac';
+};
+
 export const getExtensionForQuality = (quality) => {
     switch (quality) {
         case 'LOW':
@@ -90,9 +140,9 @@ export const getExtensionForQuality = (quality) => {
     }
 };
 
-export const buildTrackFilename = (track, quality) => {
+export const buildTrackFilename = (track, quality, extension = null) => {
     const template = localStorage.getItem('filename-template') || '{trackNumber} - {artist} - {title}';
-    const extension = getExtensionForQuality(quality);
+    const ext = extension || getExtensionForQuality(quality);
 
     const artistName = track.artist?.name || track.artists?.[0]?.name || 'Unknown Artist';
 
@@ -103,7 +153,7 @@ export const buildTrackFilename = (track, quality) => {
         album: track.album?.title,
     };
 
-    return formatTemplate(template, data) + '.' + extension;
+    return formatTemplate(template, data) + '.' + ext;
 };
 
 const sanitizeToken = (value) => {
@@ -234,7 +284,16 @@ export const getTrackArtists = (track = {}, { fallback = 'Unknown Artist' } = {}
 export const getTrackArtistsHTML = (track = {}, { fallback = 'Unknown Artist' } = {}) => {
     if (track?.artists?.length) {
         return track.artists
-            .map((artist) => `<span class="artist-link" data-artist-id="${artist.id}">${artist.name}</span>`)
+            .map((artist) => {
+                // Check if this is a tracker/unreleased track
+                const isTracker = track.isTracker || (track.id && String(track.id).startsWith('tracker-'));
+                if (isTracker && track.trackerInfo?.sheetId) {
+                    // For tracker tracks, link to the tracker artist page
+                    return `<span class="artist-link tracker-artist-link" data-tracker-sheet-id="${track.trackerInfo.sheetId}">${artist.name}</span>`;
+                }
+                // For normal tracks, use the artist ID
+                return `<span class="artist-link" data-artist-id="${artist.id}">${artist.name}</span>`;
+            })
             .join(', ');
     }
 
@@ -272,12 +331,62 @@ export const formatDuration = (seconds) => {
 
 const coverCache = new Map();
 
+function resizeImageBlob(blob, size) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        const url = URL.createObjectURL(blob);
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, size, size);
+            canvas.toBlob(
+                (resizedBlob) => {
+                    if (resizedBlob) resolve(resizedBlob);
+                    else reject(new Error('Canvas toBlob failed'));
+                },
+                blob.type || 'image/jpeg',
+                0.9
+            );
+        };
+        img.onerror = (e) => {
+            URL.revokeObjectURL(url);
+            reject(e);
+        };
+        img.src = url;
+    });
+}
+
 /**
  * Fetches and caches cover art as a Blob
  */
 export async function getCoverBlob(api, coverId) {
     if (!coverId) return null;
-    if (coverCache.has(coverId)) return coverCache.get(coverId);
+
+    let sizeStr = coverArtSizeSettings.getSize();
+
+    if (sizeStr.includes('x')) {
+        sizeStr = sizeStr.split('x')[0];
+    }
+
+    let requestedSize = parseInt(sizeStr, 10);
+    if (isNaN(requestedSize) || requestedSize <= 0) requestedSize = 1280;
+
+    const cacheKey = `${coverId}-${requestedSize}`;
+    if (coverCache.has(cacheKey)) return coverCache.get(cacheKey);
+
+    // Tidal seems to only support these soooo
+    const supportedSizes = [80, 160, 320, 640, 1280];
+    let fetchSize = 1280;
+
+    const bestSize = supportedSizes.find((s) => s >= requestedSize);
+    if (bestSize) {
+        fetchSize = bestSize;
+    }
 
     const fetchWithProxy = async (url) => {
         try {
@@ -290,30 +399,33 @@ export async function getCoverBlob(api, coverId) {
         return null;
     };
 
+    let blob = null;
     try {
-        const url = api.getCoverUrl(coverId, '1280');
+        const url = api.getCoverUrl(coverId, fetchSize.toString());
         // Try direct fetch first
         const response = await fetch(url);
         if (response.ok) {
-            const blob = await response.blob();
-            coverCache.set(coverId, blob);
-            return blob;
+            blob = await response.blob();
         } else {
             // If direct fetch fails (e.g. 404 from SW due to CORS), try proxy
-            const blob = await fetchWithProxy(url);
-            if (blob) {
-                coverCache.set(coverId, blob);
-                return blob;
-            }
+            blob = await fetchWithProxy(url);
         }
     } catch {
         // Network error (CORS rejection not handled by SW), try proxy
-        const url = api.getCoverUrl(coverId, '1280');
-        const blob = await fetchWithProxy(url);
-        if (blob) {
-            coverCache.set(coverId, blob);
-            return blob;
+        const url = api.getCoverUrl(coverId, fetchSize.toString());
+        blob = await fetchWithProxy(url);
+    }
+
+    if (blob) {
+        if (fetchSize !== requestedSize) {
+            try {
+                blob = await resizeImageBlob(blob, requestedSize);
+            } catch (e) {
+                console.warn('Failed to resize cover art, using original size:', e);
+            }
         }
+        coverCache.set(cacheKey, blob);
+        return blob;
     }
     return null;
 }

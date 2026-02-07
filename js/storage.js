@@ -1,6 +1,6 @@
 //storage.js
 export const apiSettings = {
-    STORAGE_KEY: 'monochrome-api-instances-v3',
+    STORAGE_KEY: 'monochrome-api-instances-v6',
     INSTANCES_URL: 'instances.json',
     SPEED_TEST_CACHE_KEY: 'monochrome-instance-speeds',
     SPEED_TEST_CACHE_DURATION: 1000 * 60 * 60,
@@ -54,12 +54,21 @@ export const apiSettings = {
             console.error('Failed to load instances from GitHub:', error);
             this.defaultInstances = {
                 api: [
+                    'https://arran.monochrome.tf',
+                    'https://api.monochrome.tf',
                     'https://triton.squid.wtf',
                     'https://wolf.qqdl.site',
                     'https://tidal-api.binimum.org',
                     'https://monochrome-api.samidy.com',
+                    'https://hifi-one.spotisaver.net',
+                    'https://hifi-two.spotisaver.net',
+                    'https://maus.qqdl.site',
+                    'https://tidal.kinoplus.online',
+                    'https://hund.qqdl.site',
+                    'https://vogel.qqdl.site',
                 ],
                 streaming: [
+                    'https://arran.monochrome.tf',
                     'https://triton.squid.wtf',
                     'https://wolf.qqdl.site',
                     'https://maus.qqdl.site',
@@ -196,33 +205,26 @@ export const apiSettings = {
         const targetUrls = instancesObj[type] || instancesObj.api || [];
         if (targetUrls.length === 0) return [];
 
+        // Use cached speed results to sort if available, but DON'T run new speed tests
+        // Speed tests should only run explicitly via refreshSpeedTests() to avoid
+        // mass /track API calls when playing a song
         const speedCache = this.getCachedSpeedTests();
-        // Construct cache key based on type
         const getCacheKey = (u) => (type === 'streaming' ? `${u}#streaming` : u);
 
-        const urlsToTest = targetUrls.filter((url) => !speedCache.speeds[getCacheKey(url)]);
+        // Sort by cached speeds if we have any cached data
+        const hasCachedData = targetUrls.some((url) => speedCache.speeds[getCacheKey(url)]);
 
-        if (urlsToTest.length > 0) {
-            const results = await this.testSpecificUrls(urlsToTest, type);
-            this.updateSpeedCache(results);
-            Object.assign(speedCache, this.getCachedSpeedTests());
-        }
-
-        const sortList = (list) => {
-            return [...list].sort((a, b) => {
+        if (hasCachedData) {
+            const sortedList = [...targetUrls].sort((a, b) => {
                 const speedA = speedCache.speeds[getCacheKey(a)]?.speed ?? Infinity;
                 const speedB = speedCache.speeds[getCacheKey(b)]?.speed ?? Infinity;
                 return speedA - speedB;
             });
-        };
+            return sortedList;
+        }
 
-        const sortedList = sortList(targetUrls);
-
-        // Persist the sorted order
-        instancesObj[type] = sortedList;
-        this.saveInstances(instancesObj);
-
-        return sortedList;
+        // No cached data - return in default order without testing
+        return targetUrls;
     },
 
     async refreshSpeedTests() {
@@ -459,25 +461,6 @@ export const backgroundSettings = {
     },
 };
 
-export const trackListSettings = {
-    STORAGE_KEY: 'track-list-actions-mode',
-
-    getMode() {
-        try {
-            const mode = localStorage.getItem(this.STORAGE_KEY) || 'dropdown';
-            document.documentElement.setAttribute('data-track-actions-mode', mode);
-            return mode;
-        } catch {
-            return 'dropdown';
-        }
-    },
-
-    setMode(mode) {
-        localStorage.setItem(this.STORAGE_KEY, mode);
-        document.documentElement.setAttribute('data-track-actions-mode', mode);
-    },
-};
-
 export const cardSettings = {
     COMPACT_ARTIST_KEY: 'card-compact-artist',
     COMPACT_ALBUM_KEY: 'card-compact-album',
@@ -540,6 +523,20 @@ export const downloadQualitySettings = {
     },
 };
 
+export const coverArtSizeSettings = {
+    STORAGE_KEY: 'cover-art-size',
+    getSize() {
+        try {
+            return localStorage.getItem(this.STORAGE_KEY) || '1280';
+        } catch {
+            return '1280';
+        }
+    },
+    setSize(size) {
+        localStorage.setItem(this.STORAGE_KEY, size);
+    },
+};
+
 export const waveformSettings = {
     STORAGE_KEY: 'waveform-seekbar-enabled',
 
@@ -589,6 +586,23 @@ export const qualityBadgeSettings = {
     },
 };
 
+export const trackDateSettings = {
+    STORAGE_KEY: 'use-album-release-year',
+
+    useAlbumYear() {
+        try {
+            const val = localStorage.getItem(this.STORAGE_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setUseAlbumYear(enabled) {
+        localStorage.setItem(this.STORAGE_KEY, enabled ? 'true' : 'false');
+    },
+};
+
 export const bulkDownloadSettings = {
     STORAGE_KEY: 'force-individual-downloads',
 
@@ -602,6 +616,246 @@ export const bulkDownloadSettings = {
 
     setForceIndividual(enabled) {
         localStorage.setItem(this.STORAGE_KEY, enabled ? 'true' : 'false');
+    },
+};
+
+export const playlistSettings = {
+    M3U_KEY: 'playlist-generate-m3u',
+    M3U8_KEY: 'playlist-generate-m3u8',
+    CUE_KEY: 'playlist-generate-cue',
+    NFO_KEY: 'playlist-generate-nfo',
+    JSON_KEY: 'playlist-generate-json',
+    RELATIVE_PATHS_KEY: 'playlist-relative-paths',
+
+    shouldGenerateM3U() {
+        try {
+            const val = localStorage.getItem(this.M3U_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    shouldGenerateM3U8() {
+        try {
+            return localStorage.getItem(this.M3U8_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    shouldGenerateCUE() {
+        try {
+            return localStorage.getItem(this.CUE_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    shouldGenerateNFO() {
+        try {
+            return localStorage.getItem(this.NFO_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    shouldGenerateJSON() {
+        try {
+            return localStorage.getItem(this.JSON_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    shouldUseRelativePaths() {
+        try {
+            const val = localStorage.getItem(this.RELATIVE_PATHS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setGenerateM3U(enabled) {
+        localStorage.setItem(this.M3U_KEY, enabled ? 'true' : 'false');
+    },
+
+    setGenerateM3U8(enabled) {
+        localStorage.setItem(this.M3U8_KEY, enabled ? 'true' : 'false');
+    },
+
+    setGenerateCUE(enabled) {
+        localStorage.setItem(this.CUE_KEY, enabled ? 'true' : 'false');
+    },
+
+    setGenerateNFO(enabled) {
+        localStorage.setItem(this.NFO_KEY, enabled ? 'true' : 'false');
+    },
+
+    setGenerateJSON(enabled) {
+        localStorage.setItem(this.JSON_KEY, enabled ? 'true' : 'false');
+    },
+
+    setUseRelativePaths(enabled) {
+        localStorage.setItem(this.RELATIVE_PATHS_KEY, enabled ? 'true' : 'false');
+    },
+};
+
+export const visualizerSettings = {
+    SENSITIVITY_KEY: 'visualizer-sensitivity',
+    SMART_INTENSITY_KEY: 'visualizer-smart-intensity',
+    ENABLED_KEY: 'visualizer-enabled',
+    MODE_KEY: 'visualizer-mode', // 'solid' or 'blended'
+    PRESET_KEY: 'visualizer-preset',
+
+    getPreset() {
+        try {
+            return localStorage.getItem(this.PRESET_KEY) || 'lcd';
+        } catch {
+            return 'lcd';
+        }
+    },
+
+    setPreset(preset) {
+        localStorage.setItem(this.PRESET_KEY, preset);
+    },
+
+    isEnabled() {
+        try {
+            const val = localStorage.getItem(this.ENABLED_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled);
+    },
+
+    getMode() {
+        try {
+            return localStorage.getItem(this.MODE_KEY) || 'solid';
+        } catch {
+            return 'solid';
+        }
+    },
+
+    setMode(mode) {
+        localStorage.setItem(this.MODE_KEY, mode);
+    },
+
+    getSensitivity() {
+        try {
+            const val = localStorage.getItem(this.SENSITIVITY_KEY);
+            if (val === null) return 1.0;
+            return parseFloat(val);
+        } catch {
+            return 1.0;
+        }
+    },
+
+    setSensitivity(value) {
+        localStorage.setItem(this.SENSITIVITY_KEY, value);
+    },
+
+    isSmartIntensityEnabled() {
+        try {
+            const val = localStorage.getItem(this.SMART_INTENSITY_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setSmartIntensity(enabled) {
+        localStorage.setItem(this.SMART_INTENSITY_KEY, enabled);
+    },
+};
+
+export const equalizerSettings = {
+    ENABLED_KEY: 'equalizer-enabled',
+    GAINS_KEY: 'equalizer-gains',
+    PRESET_KEY: 'equalizer-preset',
+
+    isEnabled() {
+        try {
+            // Disabled by default
+            return localStorage.getItem(this.ENABLED_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled ? 'true' : 'false');
+    },
+
+    getGains() {
+        try {
+            const stored = localStorage.getItem(this.GAINS_KEY);
+            if (stored) {
+                const gains = JSON.parse(stored);
+                if (Array.isArray(gains) && gains.length === 16) {
+                    return gains;
+                }
+            }
+        } catch {
+            /* ignore */
+        }
+        // Return flat EQ (all zeros) by default
+        return new Array(16).fill(0);
+    },
+
+    setGains(gains) {
+        try {
+            if (Array.isArray(gains) && gains.length === 16) {
+                localStorage.setItem(this.GAINS_KEY, JSON.stringify(gains));
+            }
+        } catch (e) {
+            console.warn('[EQ] Failed to save gains:', e);
+        }
+    },
+
+    getPreset() {
+        try {
+            return localStorage.getItem(this.PRESET_KEY) || 'flat';
+        } catch {
+            return 'flat';
+        }
+    },
+
+    setPreset(preset) {
+        localStorage.setItem(this.PRESET_KEY, preset);
+    },
+};
+
+export const sidebarSettings = {
+    STORAGE_KEY: 'monochrome-sidebar-collapsed',
+
+    isCollapsed() {
+        try {
+            return localStorage.getItem(this.STORAGE_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setCollapsed(collapsed) {
+        localStorage.setItem(this.STORAGE_KEY, collapsed ? 'true' : 'false');
+    },
+
+    restoreState() {
+        const isCollapsed = this.isCollapsed();
+        if (isCollapsed) {
+            document.body.classList.add('sidebar-collapsed');
+            const toggleBtn = document.getElementById('sidebar-toggle');
+            if (toggleBtn) {
+                toggleBtn.innerHTML =
+                    '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+            }
+        }
     },
 };
 
@@ -632,6 +886,343 @@ export const queueManager = {
         } catch (e) {
             console.warn('Failed to save queue to localStorage:', e);
         }
+    },
+};
+
+export const listenBrainzSettings = {
+    ENABLED_KEY: 'listenbrainz-enabled',
+    TOKEN_KEY: 'listenbrainz-token',
+    CUSTOM_URL_KEY: 'listenbrainz-custom-url',
+
+    isEnabled() {
+        try {
+            return localStorage.getItem(this.ENABLED_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled ? 'true' : 'false');
+    },
+
+    getToken() {
+        try {
+            return localStorage.getItem(this.TOKEN_KEY) || '';
+        } catch {
+            return '';
+        }
+    },
+
+    setToken(token) {
+        localStorage.setItem(this.TOKEN_KEY, token);
+    },
+
+    getCustomUrl() {
+        try {
+            return localStorage.getItem(this.CUSTOM_URL_KEY) || '';
+        } catch {
+            return '';
+        }
+    },
+
+    setCustomUrl(url) {
+        localStorage.setItem(this.CUSTOM_URL_KEY, url);
+    },
+};
+
+export const malojaSettings = {
+    ENABLED_KEY: 'maloja-enabled',
+    TOKEN_KEY: 'maloja-token',
+    CUSTOM_URL_KEY: 'maloja-custom-url',
+
+    isEnabled() {
+        try {
+            return localStorage.getItem(this.ENABLED_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled ? 'true' : 'false');
+    },
+
+    getToken() {
+        try {
+            return localStorage.getItem(this.TOKEN_KEY) || '';
+        } catch {
+            return '';
+        }
+    },
+
+    setToken(token) {
+        localStorage.setItem(this.TOKEN_KEY, token);
+    },
+
+    getCustomUrl() {
+        try {
+            return localStorage.getItem(this.CUSTOM_URL_KEY) || '';
+        } catch {
+            return '';
+        }
+    },
+
+    setCustomUrl(url) {
+        localStorage.setItem(this.CUSTOM_URL_KEY, url);
+    },
+};
+
+export const libreFmSettings = {
+    ENABLED_KEY: 'librefm-enabled',
+    LOVE_ON_LIKE_KEY: 'librefm-love-on-like',
+
+    isEnabled() {
+        try {
+            return localStorage.getItem(this.ENABLED_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldLoveOnLike() {
+        try {
+            return localStorage.getItem(this.LOVE_ON_LIKE_KEY) === 'true';
+        } catch {
+            return false;
+        }
+    },
+
+    setLoveOnLike(enabled) {
+        localStorage.setItem(this.LOVE_ON_LIKE_KEY, enabled ? 'true' : 'false');
+    },
+};
+
+export const homePageSettings = {
+    SHOW_RECOMMENDED_SONGS_KEY: 'home-show-recommended-songs',
+    SHOW_RECOMMENDED_ALBUMS_KEY: 'home-show-recommended-albums',
+    SHOW_RECOMMENDED_ARTISTS_KEY: 'home-show-recommended-artists',
+    SHOW_JUMP_BACK_IN_KEY: 'home-show-jump-back-in',
+
+    shouldShowRecommendedSongs() {
+        try {
+            const val = localStorage.getItem(this.SHOW_RECOMMENDED_SONGS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowRecommendedSongs(enabled) {
+        localStorage.setItem(this.SHOW_RECOMMENDED_SONGS_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowRecommendedAlbums() {
+        try {
+            const val = localStorage.getItem(this.SHOW_RECOMMENDED_ALBUMS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowRecommendedAlbums(enabled) {
+        localStorage.setItem(this.SHOW_RECOMMENDED_ALBUMS_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowRecommendedArtists() {
+        try {
+            const val = localStorage.getItem(this.SHOW_RECOMMENDED_ARTISTS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowRecommendedArtists(enabled) {
+        localStorage.setItem(this.SHOW_RECOMMENDED_ARTISTS_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowJumpBackIn() {
+        try {
+            const val = localStorage.getItem(this.SHOW_JUMP_BACK_IN_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowJumpBackIn(enabled) {
+        localStorage.setItem(this.SHOW_JUMP_BACK_IN_KEY, enabled ? 'true' : 'false');
+    },
+};
+
+export const sidebarSectionSettings = {
+    SHOW_HOME_KEY: 'sidebar-show-home',
+    SHOW_LIBRARY_KEY: 'sidebar-show-library',
+    SHOW_RECENT_KEY: 'sidebar-show-recent',
+    SHOW_UNRELEASED_KEY: 'sidebar-show-unreleased',
+    SHOW_DONATE_KEY: 'sidebar-show-donate',
+    SHOW_SETTINGS_KEY: 'sidebar-show-settings',
+    SHOW_ACCOUNT_KEY: 'sidebar-show-account',
+    SHOW_ABOUT_KEY: 'sidebar-show-about',
+    SHOW_DOWNLOAD_KEY: 'sidebar-show-download',
+    SHOW_DISCORD_KEY: 'sidebar-show-discord',
+
+    shouldShowHome() {
+        try {
+            const val = localStorage.getItem(this.SHOW_HOME_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowHome(enabled) {
+        localStorage.setItem(this.SHOW_HOME_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowLibrary() {
+        try {
+            const val = localStorage.getItem(this.SHOW_LIBRARY_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowLibrary(enabled) {
+        localStorage.setItem(this.SHOW_LIBRARY_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowRecent() {
+        try {
+            const val = localStorage.getItem(this.SHOW_RECENT_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowRecent(enabled) {
+        localStorage.setItem(this.SHOW_RECENT_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowUnreleased() {
+        try {
+            const val = localStorage.getItem(this.SHOW_UNRELEASED_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowUnreleased(enabled) {
+        localStorage.setItem(this.SHOW_UNRELEASED_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowDonate() {
+        try {
+            const val = localStorage.getItem(this.SHOW_DONATE_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowDonate(enabled) {
+        localStorage.setItem(this.SHOW_DONATE_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowSettings() {
+        try {
+            const val = localStorage.getItem(this.SHOW_SETTINGS_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowSettings(enabled) {
+        localStorage.setItem(this.SHOW_SETTINGS_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowAccount() {
+        try {
+            const val = localStorage.getItem(this.SHOW_ACCOUNT_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowAccount(enabled) {
+        localStorage.setItem(this.SHOW_ACCOUNT_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowAbout() {
+        try {
+            const val = localStorage.getItem(this.SHOW_ABOUT_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowAbout(enabled) {
+        localStorage.setItem(this.SHOW_ABOUT_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowDownload() {
+        try {
+            const val = localStorage.getItem(this.SHOW_DOWNLOAD_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowDownload(enabled) {
+        localStorage.setItem(this.SHOW_DOWNLOAD_KEY, enabled ? 'true' : 'false');
+    },
+
+    shouldShowDiscord() {
+        try {
+            const val = localStorage.getItem(this.SHOW_DISCORD_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setShowDiscord(enabled) {
+        localStorage.setItem(this.SHOW_DISCORD_KEY, enabled ? 'true' : 'false');
+    },
+
+    applySidebarVisibility() {
+        const items = [
+            { id: 'sidebar-nav-home', check: this.shouldShowHome() },
+            { id: 'sidebar-nav-library', check: this.shouldShowLibrary() },
+            { id: 'sidebar-nav-recent', check: this.shouldShowRecent() },
+            { id: 'sidebar-nav-unreleased', check: this.shouldShowUnreleased() },
+            { id: 'sidebar-nav-donate', check: this.shouldShowDonate() },
+            { id: 'sidebar-nav-settings', check: this.shouldShowSettings() },
+            { id: 'sidebar-nav-account', check: this.shouldShowAccount() },
+            { id: 'sidebar-nav-about', check: this.shouldShowAbout() },
+            { id: 'sidebar-nav-download', check: this.shouldShowDownload() },
+            { id: 'sidebar-nav-discord', check: this.shouldShowDiscord() },
+        ];
+
+        items.forEach(({ id, check }) => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.style.display = check ? '' : 'none';
+            }
+        });
     },
 };
 

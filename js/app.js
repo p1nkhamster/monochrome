@@ -1,28 +1,53 @@
 //js/app.js
 import { LosslessAPI } from './api.js';
-import {
-    apiSettings,
-    themeManager,
-    nowPlayingSettings,
-    trackListSettings,
-    downloadQualitySettings,
-} from './storage.js';
+import { apiSettings, themeManager, nowPlayingSettings, downloadQualitySettings, sidebarSettings } from './storage.js';
 import { UIRenderer } from './ui.js';
 import { Player } from './player.js';
-import { LastFMScrobbler } from './lastfm.js';
+import { MultiScrobbler } from './multi-scrobbler.js';
 import { LyricsManager, openLyricsPanel, clearLyricsPanelSync } from './lyrics.js';
-import { createRouter, updateTabTitle } from './router.js';
-import { initializeSettings } from './settings.js';
+import { createRouter, updateTabTitle, navigate } from './router.js';
 import { initializePlayerEvents, initializeTrackInteractions, handleTrackAction } from './events.js';
 import { initializeUIInteractions } from './ui-interactions.js';
-import { downloadAlbumAsZip, downloadDiscography, downloadPlaylistAsZip } from './downloads.js';
 import { debounce, SVG_PLAY } from './utils.js';
 import { sidePanelManager } from './side-panel.js';
 import { db } from './db.js';
 import { syncManager } from './accounts/pocketbase.js';
 import { registerSW } from 'virtual:pwa-register';
 import './smooth-scrolling.js';
-import { readTrackMetadata } from './metadata.js';
+
+// Lazy-loaded modules
+let settingsModule = null;
+let downloadsModule = null;
+let trackerModule = null;
+let metadataModule = null;
+
+async function loadSettingsModule() {
+    if (!settingsModule) {
+        settingsModule = await import('./settings.js');
+    }
+    return settingsModule;
+}
+
+async function loadDownloadsModule() {
+    if (!downloadsModule) {
+        downloadsModule = await import('./downloads.js');
+    }
+    return downloadsModule;
+}
+
+async function loadTrackerModule() {
+    if (!trackerModule) {
+        trackerModule = await import('./tracker.js');
+    }
+    return trackerModule;
+}
+
+async function loadMetadataModule() {
+    if (!metadataModule) {
+        metadataModule = await import('./metadata.js');
+    }
+    return metadataModule;
+}
 
 function initializeCasting(audioPlayer, castBtn) {
     if (!castBtn) return;
@@ -187,12 +212,107 @@ document.addEventListener('DOMContentLoaded', async () => {
     const api = new LosslessAPI(apiSettings);
 
     const audioPlayer = document.getElementById('audio-player');
+
+    // i love ios and macos!!!! webkit fucking SUCKS BULLSHIT sorry ios/macos heads yall getting lossless only
+    const ua = navigator.userAgent.toLowerCase();
+    const isIOS = /iphone|ipad|ipod/.test(ua) || (ua.includes('mac') && navigator.maxTouchPoints > 1);
+    const isSafari =
+        ua.includes('safari') && !ua.includes('chrome') && !ua.includes('crios') && !ua.includes('android');
+
+    if (isIOS || isSafari) {
+        const qualitySelect = document.getElementById('streaming-quality-setting');
+        const downloadSelect = document.getElementById('download-quality-setting');
+
+        const removeHiRes = (select) => {
+            if (!select) return;
+            const option = select.querySelector('option[value="HI_RES_LOSSLESS"]');
+            if (option) option.remove();
+        };
+
+        removeHiRes(qualitySelect);
+        removeHiRes(downloadSelect);
+
+        const currentQualitySetting = localStorage.getItem('playback-quality');
+        if (!currentQualitySetting || currentQualitySetting === 'HI_RES_LOSSLESS') {
+            localStorage.setItem('playback-quality', 'LOSSLESS');
+        }
+    }
+
     const currentQuality = localStorage.getItem('playback-quality') || 'HI_RES_LOSSLESS';
     const player = new Player(audioPlayer, api, currentQuality);
 
     const ui = new UIRenderer(api, player);
-    const scrobbler = new LastFMScrobbler();
+    const scrobbler = new MultiScrobbler();
     const lyricsManager = new LyricsManager(api);
+
+    const originalRenderPlaylistPage = ui.renderPlaylistPage.bind(ui);
+    ui.renderPlaylistPage = async function (id, type) {
+        await originalRenderPlaylistPage(id, type);
+
+        if (type === 'user') {
+            try {
+                const playlist = await db.getPlaylist(id);
+                const imgElement = document.getElementById('playlist-detail-image');
+
+                if (!imgElement) return;
+
+                let container = imgElement.parentElement;
+                let collageElement = document.getElementById('playlist-detail-collage');
+
+                if (!container.classList.contains('detail-header-cover-container')) {
+                    container = document.createElement('div');
+                    container.className = 'detail-header-cover-container';
+                    imgElement.parentNode.insertBefore(container, imgElement);
+                    container.appendChild(imgElement);
+
+                    collageElement = document.createElement('div');
+                    collageElement.id = 'playlist-detail-collage';
+                    collageElement.className = 'detail-header-collage';
+                    collageElement.style.display = 'none';
+                    container.appendChild(collageElement);
+                }
+
+                if (playlist && !playlist.cover && collageElement && playlist.tracks && playlist.tracks.length > 0) {
+                    const tracksWithCovers = playlist.tracks.filter((t) => t.album && t.album.cover);
+
+                    if (tracksWithCovers.length > 0) {
+                        imgElement.style.setProperty('display', 'none', 'important');
+                        collageElement.style.display = 'grid';
+                        collageElement.innerHTML = '';
+
+                        const uniqueCovers = [];
+                        const seen = new Set();
+                        for (const t of tracksWithCovers) {
+                            if (!seen.has(t.album.cover)) {
+                                seen.add(t.album.cover);
+                                uniqueCovers.push(t.album.cover);
+                                if (uniqueCovers.length >= 4) break;
+                            }
+                        }
+
+                        const images = [];
+                        for (let i = 0; i < 4; i++) {
+                            images.push(uniqueCovers[i % uniqueCovers.length]);
+                        }
+
+                        images.forEach((src) => {
+                            const img = document.createElement('img');
+                            img.src = api.getCoverUrl(src);
+                            collageElement.appendChild(img);
+                        });
+                    } else {
+                        imgElement.style.removeProperty('display');
+                        collageElement.style.display = 'none';
+                    }
+                } else if (collageElement) {
+                    imgElement.style.removeProperty('display');
+                    collageElement.style.display = 'none';
+                }
+            } catch (e) {
+                console.error('Error generating playlist cover:', e);
+            }
+        }
+    };
 
     // Check browser support for local files
     const selectLocalBtn = document.getElementById('select-local-folder-btn');
@@ -209,16 +329,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Pre-load Kuroshiro for romaji conversion in background (always load so it's ready instantly)
-    lyricsManager.loadKuroshiro().catch((err) => {
-        console.warn('Failed to pre-load Kuroshiro:', err);
-    });
+    // Kuroshiro is now loaded on-demand only when needed for Asian text with Romaji mode enabled
 
     const currentTheme = themeManager.getTheme();
     themeManager.setTheme(currentTheme);
-    trackListSettings.getMode();
 
+    // Restore sidebar state
+    sidebarSettings.restoreState();
+
+    // Load settings module and initialize
+    const { initializeSettings } = await loadSettingsModule();
     initializeSettings(scrobbler, player, api, ui);
+
     initializePlayerEvents(player, audioPlayer, scrobbler, ui);
     initializeTrackInteractions(
         player,
@@ -229,8 +351,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         ui,
         scrobbler
     );
-    initializeUIInteractions(player, api);
+    initializeUIInteractions(player, api, ui);
     initializeKeyboardShortcuts(player, audioPlayer);
+
+    // Load tracker module
+    const { initTracker } = await loadTrackerModule();
+    initTracker(player);
 
     const castBtn = document.getElementById('cast-btn');
     initializeCasting(audioPlayer, castBtn);
@@ -260,7 +386,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (mode === 'cover') {
             const overlay = document.getElementById('fullscreen-cover-overlay');
             if (overlay && overlay.style.display === 'flex') {
-                ui.closeFullscreenCover();
+                if (window.location.hash === '#fullscreen') {
+                    window.history.back();
+                } else {
+                    ui.closeFullscreenCover();
+                }
             } else {
                 const nextTrack = player.getNextTrack();
                 ui.showFullscreenCover(player.currentTrack, nextTrack, lyricsManager, audioPlayer);
@@ -268,7 +398,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             // Default to 'album' mode - navigate to album
             if (player.currentTrack.album?.id) {
-                window.location.hash = `#album/${player.currentTrack.album.id}`;
+                navigate(`/album/${player.currentTrack.album.id}`);
             }
         }
     });
@@ -280,11 +410,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     document.getElementById('close-fullscreen-cover-btn')?.addEventListener('click', () => {
-        ui.closeFullscreenCover();
+        if (window.location.hash === '#fullscreen') {
+            window.history.back();
+        } else {
+            ui.closeFullscreenCover();
+        }
     });
 
     document.getElementById('fullscreen-cover-image')?.addEventListener('click', () => {
-        ui.closeFullscreenCover();
+        if (window.location.hash === '#fullscreen') {
+            window.history.back();
+        } else {
+            ui.closeFullscreenCover();
+        }
+    });
+
+    document.getElementById('sidebar-toggle')?.addEventListener('click', () => {
+        document.body.classList.toggle('sidebar-collapsed');
+        const isCollapsed = document.body.classList.contains('sidebar-collapsed');
+        const toggleBtn = document.getElementById('sidebar-toggle');
+        if (toggleBtn) {
+            toggleBtn.innerHTML = isCollapsed
+                ? '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>'
+                : '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>';
+        }
+        // Save sidebar state to localStorage
+        sidebarSettings.setCollapsed(isCollapsed);
     });
 
     document.getElementById('nav-back')?.addEventListener('click', () => {
@@ -342,6 +493,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             const nextTrack = player.getNextTrack();
             ui.showFullscreenCover(player.currentTrack, nextTrack, lyricsManager, audioPlayer);
         }
+
+        // DEV: Auto-open fullscreen mode if ?fullscreen=1 in URL
+        const urlParams = new URLSearchParams(window.location.search);
+        if (
+            urlParams.get('fullscreen') === '1' &&
+            fullscreenOverlay &&
+            getComputedStyle(fullscreenOverlay).display === 'none'
+        ) {
+            const nextTrack = player.getNextTrack();
+            ui.showFullscreenCover(player.currentTrack, nextTrack, lyricsManager, audioPlayer);
+        }
     });
 
     document.addEventListener('click', async (e) => {
@@ -349,26 +511,75 @@ document.addEventListener('DOMContentLoaded', async () => {
             const btn = e.target.closest('#play-album-btn');
             if (btn.disabled) return;
 
-            const albumId = window.location.hash.split('/')[1];
+            const pathParts = window.location.pathname.split('/');
+            const albumIndex = pathParts.indexOf('album');
+            const albumId = albumIndex !== -1 ? pathParts[albumIndex + 1] : null;
+
             if (!albumId) return;
 
             try {
                 const { tracks } = await api.getAlbum(albumId);
-                if (tracks.length > 0) {
-                    player.setQueue(tracks, 0);
-                    document.getElementById('shuffle-btn').classList.remove('active');
+                if (tracks && tracks.length > 0) {
+                    // Sort tracks by disc and track number for consistent playback
+                    const sortedTracks = [...tracks].sort((a, b) => {
+                        const discA = a.volumeNumber ?? a.discNumber ?? 1;
+                        const discB = b.volumeNumber ?? b.discNumber ?? 1;
+                        if (discA !== discB) return discA - discB;
+                        return a.trackNumber - b.trackNumber;
+                    });
+
+                    player.setQueue(sortedTracks, 0);
+                    const shuffleBtn = document.getElementById('shuffle-btn');
+                    if (shuffleBtn) shuffleBtn.classList.remove('active');
+                    player.shuffleActive = false;
                     player.playTrackFromQueue();
                 }
             } catch (error) {
                 console.error('Failed to play album:', error);
-                alert('Failed to play album: ' + error.message);
+                const { showNotification } = await loadDownloadsModule();
+                showNotification('Failed to play album');
             }
+        }
+
+        if (e.target.closest('#shuffle-album-btn')) {
+            const btn = e.target.closest('#shuffle-album-btn');
+            if (btn.disabled) return;
+
+            const pathParts = window.location.pathname.split('/');
+            const albumIndex = pathParts.indexOf('album');
+            const albumId = albumIndex !== -1 ? pathParts[albumIndex + 1] : null;
+
+            if (!albumId) return;
+
+            try {
+                const { tracks } = await api.getAlbum(albumId);
+                if (tracks && tracks.length > 0) {
+                    const shuffledTracks = [...tracks].sort(() => Math.random() - 0.5);
+                    player.setQueue(shuffledTracks, 0);
+                    const shuffleBtn = document.getElementById('shuffle-btn');
+                    if (shuffleBtn) shuffleBtn.classList.remove('active');
+                    player.shuffleActive = false;
+                    player.playTrackFromQueue();
+                    const { showNotification } = await loadDownloadsModule();
+                    showNotification('Shuffling album');
+                }
+            } catch (error) {
+                console.error('Failed to shuffle album:', error);
+                const { showNotification } = await loadDownloadsModule();
+                showNotification('Failed to shuffle album');
+            }
+        }
+
+        if (e.target.closest('#shuffle-artist-btn')) {
+            const btn = e.target.closest('#shuffle-artist-btn');
+            if (btn.disabled) return;
+            document.getElementById('play-artist-radio-btn')?.click();
         }
         if (e.target.closest('#download-mix-btn')) {
             const btn = e.target.closest('#download-mix-btn');
             if (btn.disabled) return;
 
-            const mixId = window.location.hash.split('#mix/')[1];
+            const mixId = window.location.pathname.split('/')[2];
             if (!mixId) return;
 
             btn.disabled = true;
@@ -378,6 +589,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             try {
                 const { mix, tracks } = await api.getMix(mixId);
+                const { downloadPlaylistAsZip } = await loadDownloadsModule();
                 await downloadPlaylistAsZip(mix, tracks, api, downloadQualitySettings.getQuality(), lyricsManager);
             } catch (error) {
                 console.error('Mix download failed:', error);
@@ -392,7 +604,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const btn = e.target.closest('#download-playlist-btn');
             if (btn.disabled) return;
 
-            const playlistId = window.location.hash.split('/')[1];
+            const playlistId = window.location.pathname.split('/')[2];
             if (!playlistId) return;
 
             btn.disabled = true;
@@ -421,6 +633,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     tracks = data.tracks;
                 }
 
+                const { downloadPlaylistAsZip } = await loadDownloadsModule();
                 await downloadPlaylistAsZip(playlist, tracks, api, downloadQualitySettings.getQuality(), lyricsManager);
             } catch (error) {
                 console.error('Playlist download failed:', error);
@@ -448,6 +661,37 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             modal.classList.add('active');
             document.getElementById('playlist-name-input').focus();
+        }
+
+        if (e.target.closest('#create-folder-btn')) {
+            const modal = document.getElementById('folder-modal');
+            document.getElementById('folder-name-input').value = '';
+            document.getElementById('folder-cover-input').value = '';
+            modal.classList.add('active');
+            document.getElementById('folder-name-input').focus();
+        }
+
+        if (e.target.closest('#folder-modal-save')) {
+            const name = document.getElementById('folder-name-input').value.trim();
+            const cover = document.getElementById('folder-cover-input').value.trim();
+
+            if (name) {
+                await db.createFolder(name, cover);
+                ui.renderLibraryPage();
+                document.getElementById('folder-modal').classList.remove('active');
+            }
+        }
+
+        if (e.target.closest('#folder-modal-cancel')) {
+            document.getElementById('folder-modal').classList.remove('active');
+        }
+
+        if (e.target.closest('#delete-folder-btn')) {
+            const folderId = window.location.pathname.split('/')[2];
+            if (folderId && confirm('Are you sure you want to delete this folder?')) {
+                await db.deleteFolder(folderId);
+                navigate('/library');
+            }
         }
 
         if (e.target.closest('#playlist-modal-save')) {
@@ -489,7 +733,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                             syncManager.syncUserPlaylist(playlist, 'update');
                             ui.renderLibraryPage();
                             // Also update current page if we are on it
-                            if (window.location.hash === `#userplaylist/${editingId}`) {
+                            if (window.location.pathname === `/userplaylist/${editingId}`) {
                                 ui.renderPlaylistPage(editingId, 'user');
                             }
                             modal.classList.remove('active');
@@ -563,6 +807,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                     }
 
                     const cover = document.getElementById('playlist-cover-input').value.trim();
+
+                    // Check for pending tracks (from Add to Playlist -> New Playlist)
+                    const modal = document.getElementById('playlist-modal');
+                    if (modal._pendingTracks && Array.isArray(modal._pendingTracks)) {
+                        tracks = [...tracks, ...modal._pendingTracks];
+                        delete modal._pendingTracks;
+                        // Also clear CSV input if we came from there? No, keep it separate.
+                        console.log(`Added ${tracks.length} tracks (including pending)`);
+                    }
+
                     db.createPlaylist(name, tracks, cover).then(async (playlist) => {
                         await handlePublicStatus(playlist);
                         // Update DB again with isPublic flag
@@ -600,7 +854,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (shareBtn) {
                         shareBtn.style.display = playlist.isPublic ? 'flex' : 'none';
                         shareBtn.onclick = () => {
-                            const url = `${window.location.origin}${window.location.pathname}#userplaylist/${playlist.id}`;
+                            const url = `${window.location.origin}/userplaylist/${playlist.id}`;
                             navigator.clipboard.writeText(url).then(() => alert('Link copied to clipboard!'));
                         };
                     }
@@ -625,7 +879,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         if (e.target.closest('#edit-playlist-btn')) {
-            const playlistId = window.location.hash.split('/')[1];
+            const playlistId = window.location.pathname.split('/')[2];
             db.getPlaylist(playlistId).then((playlist) => {
                 if (playlist) {
                     const modal = document.getElementById('playlist-modal');
@@ -640,7 +894,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (shareBtn) {
                         shareBtn.style.display = playlist.isPublic ? 'flex' : 'none';
                         shareBtn.onclick = () => {
-                            const url = `${window.location.origin}${window.location.pathname}#userplaylist/${playlist.id}`;
+                            const url = `${window.location.origin}/userplaylist/${playlist.id}`;
                             navigator.clipboard.writeText(url).then(() => alert('Link copied to clipboard!'));
                         };
                     }
@@ -654,11 +908,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         if (e.target.closest('#delete-playlist-btn')) {
-            const playlistId = window.location.hash.split('/')[1];
+            const playlistId = window.location.pathname.split('/')[2];
             if (confirm('Are you sure you want to delete this playlist?')) {
                 db.deletePlaylist(playlistId).then(() => {
                     syncManager.syncUserPlaylist({ id: playlistId }, 'delete');
-                    window.location.hash = '#library';
+                    navigate('/library');
                 });
             }
         }
@@ -666,11 +920,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (e.target.closest('.remove-from-playlist-btn')) {
             e.stopPropagation();
             const btn = e.target.closest('.remove-from-playlist-btn');
-            const index = parseInt(btn.dataset.trackIndex);
-            const playlistId = window.location.hash.split('/')[1];
+            const playlistId = window.location.pathname.split('/')[2];
+
             db.getPlaylist(playlistId).then(async (playlist) => {
-                if (playlist && playlist.tracks[index]) {
-                    const trackId = playlist.tracks[index].id;
+                let trackId = null;
+
+                // Prefer ID if available (from sorted view)
+                if (btn.dataset.trackId) {
+                    trackId = btn.dataset.trackId;
+                } else if (btn.dataset.trackIndex) {
+                    // Fallback to index (legacy/unsorted)
+                    const index = parseInt(btn.dataset.trackIndex);
+                    if (playlist && playlist.tracks[index]) {
+                        trackId = playlist.tracks[index].id;
+                    }
+                }
+
+                if (trackId) {
                     const updatedPlaylist = await db.removeTrackFromPlaylist(playlistId, trackId);
                     syncManager.syncUserPlaylist(updatedPlaylist, 'update');
                     const scrollTop = document.querySelector('.main-content').scrollTop;
@@ -684,7 +950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const btn = e.target.closest('#play-playlist-btn');
             if (btn.disabled) return;
 
-            const playlistId = window.location.hash.split('/')[1];
+            const playlistId = window.location.pathname.split('/')[2];
             if (!playlistId) return;
 
             try {
@@ -721,7 +987,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const btn = e.target.closest('#download-album-btn');
             if (btn.disabled) return;
 
-            const albumId = window.location.hash.split('/')[1];
+            const albumId = window.location.pathname.split('/')[2];
             if (!albumId) return;
 
             btn.disabled = true;
@@ -731,6 +997,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             try {
                 const { album, tracks } = await api.getAlbum(albumId);
+                const { downloadAlbumAsZip } = await loadDownloadsModule();
                 await downloadAlbumAsZip(album, tracks, api, downloadQualitySettings.getQuality(), lyricsManager);
             } catch (error) {
                 console.error('Album download failed:', error);
@@ -741,11 +1008,108 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
 
+        if (e.target.closest('#add-album-to-playlist-btn')) {
+            const btn = e.target.closest('#add-album-to-playlist-btn');
+            if (btn.disabled) return;
+
+            const albumId = window.location.pathname.split('/')[2];
+            if (!albumId) return;
+
+            try {
+                const { tracks } = await api.getAlbum(albumId);
+
+                if (!tracks || tracks.length === 0) {
+                    const { showNotification } = await loadDownloadsModule();
+                    showNotification('No tracks found in this album.');
+                    return;
+                }
+
+                const modal = document.getElementById('playlist-select-modal');
+                const list = document.getElementById('playlist-select-list');
+                const cancelBtn = document.getElementById('playlist-select-cancel');
+                const overlay = modal.querySelector('.modal-overlay');
+
+                const playlists = await db.getPlaylists(false);
+
+                list.innerHTML =
+                    `
+                    <div class="modal-option create-new-option" style="border-bottom: 1px solid var(--border); margin-bottom: 0.5rem;">
+                        <span style="font-weight: 600; color: var(--primary);">+ Create New Playlist</span>
+                    </div>
+                ` +
+                    playlists
+                        .map(
+                            (p) => `
+                    <div class="modal-option" data-id="${p.id}">
+                        <span>${p.name}</span>
+                    </div>
+                `
+                        )
+                        .join('');
+
+                const closeModal = () => {
+                    modal.classList.remove('active');
+                    cleanup();
+                };
+
+                const handleOptionClick = async (e) => {
+                    const option = e.target.closest('.modal-option');
+                    if (!option) return;
+
+                    if (option.classList.contains('create-new-option')) {
+                        closeModal();
+                        const createModal = document.getElementById('playlist-modal');
+                        document.getElementById('playlist-modal-title').textContent = 'Create Playlist';
+                        document.getElementById('playlist-name-input').value = '';
+                        document.getElementById('playlist-cover-input').value = '';
+                        createModal.dataset.editingId = '';
+                        document.getElementById('csv-import-section').style.display = 'none'; // Hide CSV for simple add
+
+                        // Pass tracks
+                        createModal._pendingTracks = tracks;
+
+                        createModal.classList.add('active');
+                        document.getElementById('playlist-name-input').focus();
+                        return;
+                    }
+
+                    const playlistId = option.dataset.id;
+
+                    try {
+                        await db.addTracksToPlaylist(playlistId, tracks);
+                        const { showNotification } = await loadDownloadsModule();
+                        showNotification(`Added ${tracks.length} tracks to playlist.`);
+                        closeModal();
+                    } catch (err) {
+                        console.error(err);
+                        const { showNotification } = await loadDownloadsModule();
+                        showNotification('Failed to add tracks.');
+                    }
+                };
+
+                const cleanup = () => {
+                    cancelBtn.removeEventListener('click', closeModal);
+                    overlay.removeEventListener('click', closeModal);
+                    list.removeEventListener('click', handleOptionClick);
+                };
+
+                cancelBtn.addEventListener('click', closeModal);
+                overlay.addEventListener('click', closeModal);
+                list.addEventListener('click', handleOptionClick);
+
+                modal.classList.add('active');
+            } catch (error) {
+                console.error('Failed to prepare album for playlist:', error);
+                const { showNotification } = await loadDownloadsModule();
+                showNotification('Failed to load album tracks.');
+            }
+        }
+
         if (e.target.closest('#play-artist-radio-btn')) {
             const btn = e.target.closest('#play-artist-radio-btn');
             if (btn.disabled) return;
 
-            const artistId = window.location.hash.split('/')[1];
+            const artistId = window.location.pathname.split('/')[2];
             if (!artistId) return;
 
             btn.disabled = true;
@@ -833,11 +1197,37 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
 
+        if (e.target.closest('#download-liked-tracks-btn')) {
+            const btn = e.target.closest('#download-liked-tracks-btn');
+            if (btn.disabled) return;
+
+            btn.disabled = true;
+            const originalHTML = btn.innerHTML;
+            btn.innerHTML =
+                '<svg class="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>';
+
+            try {
+                const likedTracks = await db.getFavorites('track');
+                if (likedTracks.length === 0) {
+                    alert('No liked tracks to download.');
+                    return;
+                }
+                const { downloadLikedTracks } = await loadDownloadsModule();
+                await downloadLikedTracks(likedTracks, api, downloadQualitySettings.getQuality(), lyricsManager);
+            } catch (error) {
+                console.error('Liked tracks download failed:', error);
+                alert('Failed to download liked tracks: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHTML;
+            }
+        }
+
         if (e.target.closest('#download-discography-btn')) {
             const btn = e.target.closest('#download-discography-btn');
             if (btn.disabled) return;
 
-            const artistId = window.location.hash.split('/')[1];
+            const artistId = window.location.pathname.split('/')[2];
             if (!artistId) return;
 
             try {
@@ -882,6 +1272,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 name.endsWith('.ogg')
                             ) {
                                 const file = await entry.getFile();
+                                const { readTrackMetadata } = await loadMetadataModule();
                                 const metadata = await readTrackMetadata(file);
                                 metadata.id = `local-${idCounter++}-${file.name}`;
                                 tracks.push(metadata);
@@ -921,9 +1312,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const searchForm = document.getElementById('search-form');
     const searchInput = document.getElementById('search-input');
 
+    // Setup clear button for search bar
+    ui.setupSearchClearButton(searchInput);
+
     const performSearch = debounce((query) => {
         if (query) {
-            window.location.hash = `#search/${encodeURIComponent(query)}`;
+            navigate(`/search/${encodeURIComponent(query)}`);
         }
     }, 300);
 
@@ -934,11 +1328,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    searchInput.addEventListener('change', (e) => {
+        const query = e.target.value.trim();
+        if (query.length > 2) {
+            ui.addToSearchHistory(query);
+        }
+    });
+
+    searchInput.addEventListener('focus', () => {
+        ui.renderSearchHistory();
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.search-bar')) {
+            const historyEl = document.getElementById('search-history');
+            if (historyEl) historyEl.style.display = 'none';
+        }
+    });
+
     searchForm.addEventListener('submit', (e) => {
         e.preventDefault();
         const query = searchInput.value.trim();
         if (query) {
-            window.location.hash = `#search/${encodeURIComponent(query)}`;
+            ui.addToSearchHistory(query);
+            navigate(`/search/${encodeURIComponent(query)}`);
+            const historyEl = document.getElementById('search-history');
+            if (historyEl) historyEl.style.display = 'none';
         }
     });
 
@@ -952,85 +1367,50 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.log('Gone offline');
     });
 
-    document.querySelector('.play-pause-btn').innerHTML = SVG_PLAY;
+    document.querySelector('.now-playing-bar .play-pause-btn').innerHTML = SVG_PLAY;
 
     const router = createRouter(ui);
 
-    // Session-based scroll positions (transient, cleared on refresh)
-    const scrollPositions = new Map();
-    const navStack = [window.location.hash];
-    let navIndex = 0;
-    let isGoingBack = false;
+    const handleRouteChange = async (event) => {
+        const overlay = document.getElementById('fullscreen-cover-overlay');
+        const isFullscreenOpen = overlay && getComputedStyle(overlay).display === 'flex';
 
-    const updateNavButtons = () => {
-        const backBtn = document.getElementById('nav-back');
-        const fwdBtn = document.getElementById('nav-forward');
-        if (backBtn) backBtn.disabled = navIndex <= 0;
-        if (fwdBtn) fwdBtn.disabled = navIndex >= navStack.length - 1;
-    };
-
-    const handleRouter = async (e) => {
-        const hash = window.location.hash;
-
-        // 1. Update history state and determine direction
-        if (e && e.oldURL) {
-            try {
-                const url = new URL(e.oldURL);
-                const oldHash = url.hash || '#home';
-
-                // Save scroll position for the old page
-                const content = document.querySelector('.main-content');
-                if (content) {
-                    scrollPositions.set(oldHash, content.scrollTop);
-                }
-
-                if (hash !== navStack[navIndex]) {
-                    if (navIndex > 0 && hash === navStack[navIndex - 1]) {
-                        navIndex--;
-                        isGoingBack = true;
-                    } else if (navIndex < navStack.length - 1 && hash === navStack[navIndex + 1]) {
-                        navIndex++;
-                        isGoingBack = false;
-                    } else {
-                        navIndex++;
-                        navStack.splice(navIndex);
-                        navStack.push(hash);
-                        isGoingBack = false;
-                    }
-                }
-            } catch {
-                isGoingBack = false;
-            }
+        if (isFullscreenOpen && window.location.hash !== '#fullscreen') {
+            ui.closeFullscreenCover();
         }
 
-        // 2. Render the new page
+        if (event && event.state && event.state.exitTrap) {
+            const { showNotification } = await loadDownloadsModule();
+            showNotification('Press back again to exit');
+            setTimeout(() => {
+                if (history.state && history.state.exitTrap) {
+                    history.pushState({ app: true }, '', window.location.pathname);
+                }
+            }, 2000);
+            return;
+        }
+
         await router();
-        updateNavButtons();
-
-        // 3. Handle scroll restoration
-        const content = document.querySelector('.main-content');
-        if (content) {
-            if (isGoingBack) {
-                const savedScroll = scrollPositions.get(hash || '#home');
-                if (savedScroll !== undefined) {
-                    setTimeout(() => {
-                        content.scrollTop = savedScroll;
-                    }, 0);
-                }
-            } else {
-                // For forward or new clicks, ensure we start at the top
-                content.scrollTop = 0;
-            }
-        }
-
-        // Reset flag
-        isGoingBack = false;
+        updateTabTitle(player);
     };
 
-    // Initial load
-    await handleRouter(null);
-    window.addEventListener('hashchange', handleRouter);
-    updateNavButtons();
+    await handleRouteChange();
+
+    window.addEventListener('popstate', handleRouteChange);
+
+    document.body.addEventListener('click', (e) => {
+        const link = e.target.closest('a');
+
+        if (
+            link &&
+            link.origin === window.location.origin &&
+            link.target !== '_blank' &&
+            !link.hasAttribute('download')
+        ) {
+            e.preventDefault();
+            navigate(link.pathname);
+        }
+    });
 
     audioPlayer.addEventListener('play', () => {
         updateTabTitle(player);
@@ -1046,44 +1426,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         },
     });
 
-    let deferredPrompt;
-    window.addEventListener('beforeinstallprompt', (e) => {
-        e.preventDefault();
-        deferredPrompt = e;
-
-        // Show the manual install button in settings
-        const installSetting = document.getElementById('install-app-setting');
-        if (installSetting) installSetting.style.display = 'flex';
-
-        if (!localStorage.getItem('installPromptDismissed')) {
-            showInstallPrompt(deferredPrompt);
-        }
-    });
-
-    document.getElementById('manual-install-btn')?.addEventListener('click', async () => {
-        if (deferredPrompt) {
-            deferredPrompt.prompt();
-            const { outcome } = await deferredPrompt.userChoice;
-            console.log(`User response to install prompt: ${outcome}`);
-            deferredPrompt = null;
-            const installSetting = document.getElementById('install-app-setting');
-            if (installSetting) installSetting.style.display = 'none';
-        }
-    });
-
     document.getElementById('show-shortcuts-btn')?.addEventListener('click', () => {
         showKeyboardShortcuts();
     });
 
     // Listener for Pocketbase Sync updates
     window.addEventListener('library-changed', () => {
-        const hash = window.location.hash;
-        if (hash === '#library') {
+        const path = window.location.pathname;
+        if (path === '/library') {
             ui.renderLibraryPage();
-        } else if (hash === '#home' || hash === '') {
+        } else if (path === '/' || path === '/home') {
             ui.renderHomePage();
-        } else if (hash.startsWith('#userplaylist/')) {
-            const playlistId = hash.split('/')[1];
+        } else if (path.startsWith('/userplaylist/')) {
+            const playlistId = path.split('/')[2];
             const content = document.querySelector('.main-content');
             const scroll = content ? content.scrollTop : 0;
             ui.renderPlaylistPage(playlistId, 'user').then(() => {
@@ -1092,8 +1447,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
     window.addEventListener('history-changed', () => {
-        const hash = window.location.hash;
-        if (hash === '#recent') {
+        const path = window.location.pathname;
+        if (path === '/recent') {
             ui.renderRecentPage();
         }
     });
@@ -1110,11 +1465,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                         if (track) {
                             if (albumItem) {
-                                let label = 'Album';
+                                let label = 'album';
                                 const albumType = track.album?.type?.toUpperCase();
                                 const trackCount = track.album?.numberOfTracks;
 
-                                if (albumType === 'SINGLE' || trackCount === 1) label = 'Single';
+                                if (albumType === 'SINGLE' || trackCount === 1) label = 'single';
                                 else if (albumType === 'EP') label = 'EP';
                                 else if (trackCount && trackCount <= 6) label = 'EP';
 
@@ -1155,37 +1510,6 @@ function showUpdateNotification(updateCallback) {
         } else {
             window.location.reload();
         }
-    });
-}
-
-function showInstallPrompt(deferredPrompt) {
-    if (!deferredPrompt) return;
-
-    const notification = document.createElement('div');
-    notification.className = 'install-prompt';
-    notification.innerHTML = `
-        <div>
-            <strong>Install Monochrome</strong>
-            <p>Install this app for a better experience.</p>
-        </div>
-        <div style="display: flex; gap: 0.5rem;">
-            <button class="btn-primary" id="install-btn">Install</button>
-            <button class="btn-secondary" id="dismiss-install">Dismiss</button>
-        </div>
-    `;
-    document.body.appendChild(notification);
-
-    document.getElementById('install-btn').addEventListener('click', async () => {
-        notification.remove();
-        deferredPrompt.prompt();
-        const { outcome } = await deferredPrompt.userChoice;
-        console.log(`User response to install prompt: ${outcome}`);
-        deferredPrompt = null;
-    });
-
-    document.getElementById('dismiss-install').addEventListener('click', () => {
-        notification.remove();
-        localStorage.setItem('installPromptDismissed', 'true');
     });
 }
 
@@ -1567,6 +1891,7 @@ function showDiscographyDownloadModal(artist, api, quality, lyricsManager, trigg
             '<svg class="animate-spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg><span>Downloading...</span>';
 
         try {
+            const { downloadDiscography } = await loadDownloadsModule();
             await downloadDiscography(artist, selectedReleases, api, quality, lyricsManager);
         } catch (error) {
             console.error('Discography download failed:', error);
@@ -1600,6 +1925,5 @@ function showKeyboardShortcuts() {
     };
 
     modal.addEventListener('click', handleClose);
-
     modal.classList.add('active');
 }
